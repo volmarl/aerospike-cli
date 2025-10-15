@@ -197,14 +197,26 @@ func (c *CLI) handleCommand(line string) {
 		c.handleGet(parts[1:])
 	case "delete":
 		c.handleDelete(parts[1:])
+	case "delete-digest":
+		c.handleDeleteDigest(parts[1:])
 	case "query":
 		c.handleQuery(parts[1:])
 	case "scan":
 		c.handleScan(parts[1:])
+	case "scan-touch":
+		c.handleScanTouch(parts[1:])
 	case "create-index":
 		c.handleCreateIndex(parts[1:])
 	case "drop-index":
 		c.handleDropIndex(parts[1:])
+	case "register-udf":
+		c.handleRegisterUDF(parts[1:])
+	case "list-udfs":
+		c.handleListUDFs(parts[1:])
+	case "remove-udf":
+		c.handleRemoveUDF(parts[1:])
+	case "execute-udf":
+		c.handleExecuteUDF(parts[1:])
 	case "batch-put":
 		c.handleBatchPut(parts[1:])
 	case "batch-get":
@@ -219,20 +231,72 @@ func (c *CLI) handleCommand(line string) {
 }
 
 func (c *CLI) printHelp() {
-	fmt.Println("\nAvailable Commands:")
-	fmt.Println("  put <key> <bin1>=<val1> [bin2=val2 ...]  - Insert/update a record")
-	fmt.Println("  get <key>                                  - Get a record by primary key")
-	fmt.Println("  delete <key>                               - Delete a record")
-	fmt.Println("  query <bin> <value>                        - Query by secondary index")
-	fmt.Println("  scan                                       - Scan all records in set")
-	fmt.Println("  create-index <name> <bin> <type>           - Create secondary index (numeric|string)")
-	fmt.Println("  drop-index <name>                          - Drop secondary index")
-	fmt.Println("  batch-put <key1:bin=val> <key2:bin=val>   - Batch write records")
-	fmt.Println("  batch-get <key1> <key2> ...                - Batch read records")
-	fmt.Println("  config [show|set <param> <value>]          - View/modify configuration")
-	fmt.Println("  use <namespace> [set]                      - Change namespace/set")
-	fmt.Println("  help                                       - Show this help")
-	fmt.Println("  exit, quit                                 - Exit the client")
+	fmt.Println("\n==============================================")
+	fmt.Println("         Aerospike CLI - Commands")
+	fmt.Println("==============================================")
+	
+	fmt.Println("\nBasic Operations:")
+	fmt.Println("  put <key> <bin1>=<val1> [bin2=val2 ...]")
+	fmt.Println("      Insert or update a record")
+	fmt.Println("  get <key>")
+	fmt.Println("      Get a record by primary key")
+	fmt.Println("  delete <key>")
+	fmt.Println("      Delete a record by primary key")
+	fmt.Println("  delete-digest <digest>")
+	fmt.Println("      Delete a record by its 20-byte digest (hex string)")
+	fmt.Println("  scan")
+	fmt.Println("      Scan all records in current namespace/set")
+	fmt.Println("  scan-touch")
+	fmt.Println("      Scan and touch all records (reset TTL to namespace default)")
+	
+	fmt.Println("\nSecondary Index Operations:")
+	fmt.Println("  create-index <name> <bin> <type>")
+	fmt.Println("      Create secondary index (type: numeric or string)")
+	fmt.Println("  drop-index <name>")
+	fmt.Println("      Drop secondary index")
+	fmt.Println("  query <bin> <value>")
+	fmt.Println("      Query records by secondary index")
+	
+	fmt.Println("\nUDF (User Defined Functions):")
+	fmt.Println("  register-udf <path> [server_path]")
+	fmt.Println("      Register UDF module from file")
+	fmt.Println("  list-udfs")
+	fmt.Println("      List all registered UDF modules")
+	fmt.Println("  remove-udf <filename>")
+	fmt.Println("      Remove UDF module from server")
+	fmt.Println("  execute-udf <module>.<function>(<args>) ON <ns>[.<set>] [WHERE ...]")
+	fmt.Println("      Execute UDF with various filters:")
+	fmt.Println("        ON <ns>[.<set>]")
+	fmt.Println("            Execute on all records (background)")
+	fmt.Println("        WHERE PK = <key>")
+	fmt.Println("            Execute on single record (returns result)")
+	fmt.Println("        WHERE <bin> = <value>")
+	fmt.Println("            Execute on query results (background)")
+	fmt.Println("        WHERE <bin> BETWEEN <lower> AND <upper>")
+	fmt.Println("            Execute on range query (background)")
+	fmt.Println("      Examples:")
+	fmt.Println("        execute-udf myudf.increment(salary,1000) ON test.users WHERE PK = user1")
+	fmt.Println("        execute-udf myudf.process(status,active) ON test.users WHERE age = 30")
+	fmt.Println("        execute-udf myudf.adjust(bonus,500) ON test WHERE age BETWEEN 25 AND 35")
+	
+	fmt.Println("\nBatch Operations:")
+	fmt.Println("  batch-put <key1:bin=val> <key2:bin=val> ...")
+	fmt.Println("      Batch write multiple records")
+	fmt.Println("  batch-get <key1> <key2> ...")
+	fmt.Println("      Batch read multiple records")
+	
+	fmt.Println("\nConfiguration:")
+	fmt.Println("  config [show|set <param> <value>]")
+	fmt.Println("      View or modify runtime configuration")
+	fmt.Println("  use <namespace> [set]")
+	fmt.Println("      Change current namespace/set")
+	
+	fmt.Println("\nGeneral:")
+	fmt.Println("  help")
+	fmt.Println("      Show this help message")
+	fmt.Println("  exit, quit")
+	fmt.Println("      Exit the client")
+	fmt.Println("\n==============================================")
 }
 
 func (c *CLI) handlePut(args []string) {
@@ -291,7 +355,7 @@ func (c *CLI) handleGet(args []string) {
 		return
 	}
 
-	c.printRecord(key, record)
+	c.printRecordWithMetadata(key, record)
 }
 
 func (c *CLI) handleDelete(args []string) {
@@ -317,6 +381,60 @@ func (c *CLI) handleDelete(args []string) {
 		fmt.Println("Record deleted successfully")
 	} else {
 		fmt.Println("Record did not exist")
+	}
+}
+
+func (c *CLI) handleDeleteDigest(args []string) {
+	if len(args) < 1 {
+		fmt.Println("Usage: delete-digest <digest>")
+		fmt.Println("Example: delete-digest 0a1b2c3d4e5f6789abcdef0123456789abcdef01")
+		fmt.Println("\nThe digest must be a 40-character hexadecimal string (20 bytes)")
+		return
+	}
+
+	digestHex := args[0]
+	
+	// Remove any spaces or separators
+	digestHex = strings.ReplaceAll(digestHex, " ", "")
+	digestHex = strings.ReplaceAll(digestHex, ":", "")
+	digestHex = strings.ReplaceAll(digestHex, "-", "")
+	
+	// Validate hex string length (should be 40 chars for 20 bytes)
+	if len(digestHex) != 40 {
+		fmt.Printf("Error: Digest must be exactly 40 hexadecimal characters (got %d)\n", len(digestHex))
+		return
+	}
+	
+	// Convert hex string to bytes
+	digest := make([]byte, 20)
+	for i := 0; i < 20; i++ {
+		byteStr := digestHex[i*2 : i*2+2]
+		b, err := strconv.ParseUint(byteStr, 16, 8)
+		if err != nil {
+			fmt.Printf("Error: Invalid hexadecimal character in digest: %s\n", byteStr)
+			return
+		}
+		digest[i] = byte(b)
+	}
+	
+	// Create key from digest
+	key, err := aero.NewKeyWithDigest(c.config.Namespace, c.config.Set, nil, digest)
+	if err != nil {
+		c.logError("Error creating key from digest", err)
+		return
+	}
+
+	policy := c.getWritePolicy()
+	existed, err := c.client.Delete(policy, key)
+	if err != nil {
+		c.logError("Delete failed", err)
+		return
+	}
+
+	if existed {
+		fmt.Printf("Record with digest %s deleted successfully\n", digestHex)
+	} else {
+		fmt.Printf("Record with digest %s did not exist\n", digestHex)
 	}
 }
 
@@ -381,6 +499,74 @@ func (c *CLI) handleScan(args []string) {
 	fmt.Printf("\nTotal records: %d\n", count)
 }
 
+func (c *CLI) handleScanTouch(args []string) {
+	// Confirm the operation
+	fmt.Printf("\nThis will touch ALL records in namespace '%s'", c.config.Namespace)
+	if c.config.Set != "" {
+		fmt.Printf(", set '%s'", c.config.Set)
+	}
+	fmt.Println()
+	fmt.Println("Each record's TTL will be reset to the namespace default (TTL=-2)")
+	fmt.Print("Are you sure you want to continue? (yes/no): ")
+	
+	var response string
+	fmt.Scanln(&response)
+	if strings.ToLower(response) != "yes" {
+		fmt.Println("Operation cancelled")
+		return
+	}
+
+	// Create a scan policy
+	scanPolicy := c.getScanPolicy()
+	
+	// Create write policy for touch operation with TTL=-2
+	writePolicy := c.getWritePolicy()
+	writePolicy.Expiration = aero.TTLServerDefault // Use -2 to reset to namespace default
+	writePolicy.RecordExistsAction = aero.UPDATE
+
+	fmt.Printf("\nStarting scan-touch operation...\n")
+	fmt.Println("----------------------------------------")
+	
+	recordset, err := c.client.ScanAll(scanPolicy, c.config.Namespace, c.config.Set)
+	if err != nil {
+		c.logError("Scan failed", err)
+		return
+	}
+	defer recordset.Close()
+
+	count := 0
+	errors := 0
+	
+	for result := range recordset.Results() {
+		if result.Err != nil {
+			c.logError("Scan error", result.Err)
+			errors++
+			continue
+		}
+		
+		// Touch the record (update with TTL=-2)
+		err := c.client.Touch(writePolicy, result.Record.Key)
+		if err != nil {
+			if c.config.Debug {
+				c.logError(fmt.Sprintf("Touch failed for key %v", result.Record.Key.Value()), err)
+			}
+			errors++
+		} else {
+			count++
+			if count%1000 == 0 {
+				fmt.Printf("Touched %d records...\n", count)
+			}
+		}
+	}
+
+	fmt.Println("\n----------------------------------------")
+	fmt.Printf("Scan-touch completed\n")
+	fmt.Printf("  Records touched: %d\n", count)
+	if errors > 0 {
+		fmt.Printf("  Errors: %d\n", errors)
+	}
+}
+
 func (c *CLI) handleCreateIndex(args []string) {
 	if len(args) < 3 {
 		fmt.Println("Usage: create-index <name> <bin> <type>")
@@ -416,7 +602,6 @@ func (c *CLI) handleCreateIndex(args []string) {
 		return
 	}
 
-	// Wait for index creation to complete
 	err = <-task.OnComplete()
 	if err != nil {
 		c.logError("Index creation task failed", err)
@@ -446,6 +631,369 @@ func (c *CLI) handleDropIndex(args []string) {
 	}
 
 	fmt.Printf("Secondary index '%s' dropped successfully\n", indexName)
+}
+
+func (c *CLI) handleRegisterUDF(args []string) {
+	if len(args) < 1 {
+		fmt.Println("Usage: register-udf <path> [server_path]")
+		fmt.Println("Example: register-udf /path/to/myudf.lua myudf.lua")
+		return
+	}
+
+	clientPath := args[0]
+	
+	code, err := os.ReadFile(clientPath)
+	if err != nil {
+		c.logError("Failed to read UDF file", err)
+		return
+	}
+
+	var serverPath string
+	if len(args) > 1 {
+		serverPath = args[1]
+	} else {
+		parts := strings.Split(clientPath, "/")
+		serverPath = parts[len(parts)-1]
+	}
+
+	language := aero.LUA
+	if strings.HasSuffix(serverPath, ".lua") {
+		language = aero.LUA
+	}
+
+	task, err := c.client.RegisterUDF(nil, code, serverPath, language)
+	if err != nil {
+		c.logError("Failed to register UDF", err)
+		return
+	}
+
+	err = <-task.OnComplete()
+	if err != nil {
+		c.logError("UDF registration task failed", err)
+		return
+	}
+
+	fmt.Printf("UDF module '%s' registered successfully\n", serverPath)
+}
+
+func (c *CLI) handleListUDFs(args []string) {
+	udfs, err := c.client.ListUDF(nil)
+	if err != nil {
+		c.logError("Failed to list UDFs", err)
+		return
+	}
+
+	if len(udfs) == 0 {
+		fmt.Println("No UDF modules registered")
+		return
+	}
+
+	fmt.Println("\nRegistered UDF Modules:")
+	fmt.Println("----------------------------------------")
+	for _, udf := range udfs {
+		fmt.Printf("Name: %s\n", udf.Filename)
+		fmt.Printf("  Type: %s\n", udf.Language)
+		fmt.Printf("  Hash: %s\n", udf.Hash)
+		fmt.Println()
+	}
+	fmt.Printf("Total modules: %d\n", len(udfs))
+}
+
+func (c *CLI) handleRemoveUDF(args []string) {
+	if len(args) < 1 {
+		fmt.Println("Usage: remove-udf <filename>")
+		return
+	}
+
+	filename := args[0]
+
+	task, err := c.client.RemoveUDF(nil, filename)
+	if err != nil {
+		c.logError("Failed to remove UDF", err)
+		return
+	}
+
+	err = <-task.OnComplete()
+	if err != nil {
+		c.logError("UDF removal task failed", err)
+		return
+	}
+
+	fmt.Printf("UDF module '%s' removed successfully\n", filename)
+}
+
+func (c *CLI) handleExecuteUDF(args []string) {
+	if len(args) < 3 {
+		fmt.Println("Usage: execute-udf <module>.<function>(<args>) ON <ns>[.<set>] [WHERE ...]")
+		fmt.Println("\nExamples:")
+		fmt.Println("  execute-udf myudf.increment(salary,1000) ON test.users WHERE PK = user1")
+		fmt.Println("  execute-udf myudf.process(status,active) ON test.users WHERE age = 30")
+		fmt.Println("  execute-udf myudf.update(field,value) ON test.users WHERE age BETWEEN 25 AND 35")
+		fmt.Println("  execute-udf myudf.process() ON test.users")
+		return
+	}
+
+	cmdStr := strings.Join(args, " ")
+	
+	parts := strings.Split(cmdStr, " ON ")
+	if len(parts) != 2 {
+		fmt.Println("Error: Missing 'ON' clause")
+		return
+	}
+
+	udfPart := strings.TrimSpace(parts[0])
+	onPart := strings.TrimSpace(parts[1])
+
+	if !strings.Contains(udfPart, ".") || !strings.Contains(udfPart, "(") {
+		fmt.Println("Error: Invalid UDF format. Expected: <module>.<function>(<args>)")
+		return
+	}
+
+	dotIdx := strings.Index(udfPart, ".")
+	parenIdx := strings.Index(udfPart, "(")
+	
+	if dotIdx >= parenIdx {
+		fmt.Println("Error: Invalid UDF format")
+		return
+	}
+
+	moduleName := udfPart[:dotIdx]
+	functionName := udfPart[dotIdx+1 : parenIdx]
+	
+	argsStr := udfPart[parenIdx+1:]
+	if !strings.HasSuffix(argsStr, ")") {
+		fmt.Println("Error: Missing closing parenthesis")
+		return
+	}
+	argsStr = strings.TrimSuffix(argsStr, ")")
+	
+	var udfArgs []aero.Value
+	if strings.TrimSpace(argsStr) != "" {
+		argList := strings.Split(argsStr, ",")
+		for _, arg := range argList {
+			arg = strings.TrimSpace(arg)
+			udfArgs = append(udfArgs, aero.NewValue(c.parseValue(arg)))
+		}
+	}
+
+	whereParts := strings.Split(onPart, " WHERE ")
+	nsPart := strings.TrimSpace(whereParts[0])
+	
+	var namespace, set string
+	if strings.Contains(nsPart, ".") {
+		nsSplit := strings.SplitN(nsPart, ".", 2)
+		namespace = nsSplit[0]
+		set = nsSplit[1]
+	} else {
+		namespace = nsPart
+		set = ""
+	}
+
+	if len(whereParts) == 1 {
+		c.executeUDFScan(namespace, set, moduleName, functionName, udfArgs)
+		return
+	}
+
+	whereClause := strings.TrimSpace(whereParts[1])
+	
+	if strings.HasPrefix(strings.ToUpper(whereClause), "PK =") || 
+	   strings.HasPrefix(strings.ToUpper(whereClause), "PK=") {
+		keyValue := strings.TrimSpace(whereClause[strings.Index(whereClause, "=")+1:])
+		c.executeUDFOnKey(namespace, set, keyValue, moduleName, functionName, udfArgs)
+		return
+	}
+
+	if strings.Contains(strings.ToUpper(whereClause), " BETWEEN ") {
+		c.executeUDFRange(namespace, set, whereClause, moduleName, functionName, udfArgs)
+		return
+	}
+
+	if strings.Contains(whereClause, "=") {
+		c.executeUDFQuery(namespace, set, whereClause, moduleName, functionName, udfArgs)
+		return
+	}
+
+	fmt.Println("Error: Invalid WHERE clause")
+}
+
+func (c *CLI) executeUDFOnKey(namespace, set, keyValue, module, function string, args []aero.Value) {
+	key, err := aero.NewKey(namespace, set, keyValue)
+	if err != nil {
+		c.logError("Error creating key", err)
+		return
+	}
+
+	policy := c.getWritePolicy()
+	result, err := c.client.Execute(policy, key, module, function, args...)
+	if err != nil {
+		c.logError("UDF execution failed", err)
+		return
+	}
+
+	fmt.Println("\nUDF Execution Result:")
+	fmt.Println("----------------------------------------")
+	fmt.Printf("Key: %s\n", keyValue)
+	if result != nil {
+		fmt.Printf("Result: %v (%T)\n", result, result)
+	} else {
+		fmt.Println("Result: nil")
+	}
+}
+
+func (c *CLI) executeUDFQuery(namespace, set, whereClause, module, function string, args []aero.Value) {
+	parts := strings.SplitN(whereClause, "=", 2)
+	if len(parts) != 2 {
+		fmt.Println("Error: Invalid WHERE clause format")
+		return
+	}
+
+	binName := strings.TrimSpace(parts[0])
+	value := c.parseValue(strings.TrimSpace(parts[1]))
+
+	stmt := aero.NewStatement(namespace, set)
+	stmt.SetFilter(aero.NewEqualFilter(binName, value))
+
+	policy := c.getQueryPolicy()
+	
+	fmt.Printf("\nExecuting UDF '%s.%s' on query results where %s = %v\n", module, function, binName, value)
+	fmt.Println("----------------------------------------")
+
+	task, err := c.client.ExecuteUDF(policy, stmt, module, function, args...)
+	if err != nil {
+		c.logError("Background UDF execution failed", err)
+		return
+	}
+
+	fmt.Println("Background job initiated")
+	fmt.Print("Waiting for completion")
+
+	for {
+		done, err := task.IsDone()
+		if err != nil {
+			c.logError("Error checking task status", err)
+			return
+		}
+		if done {
+			break
+		}
+		fmt.Print(".")
+		time.Sleep(500 * time.Millisecond)
+	}
+
+	fmt.Println("\n\nUDF execution completed successfully")
+}
+
+func (c *CLI) executeUDFRange(namespace, set, whereClause, module, function string, args []aero.Value) {
+	upperClause := strings.ToUpper(whereClause)
+	betweenIdx := strings.Index(upperClause, " BETWEEN ")
+	andIdx := strings.LastIndex(upperClause, " AND ")
+	
+	if betweenIdx == -1 || andIdx == -1 || andIdx <= betweenIdx {
+		fmt.Println("Error: Invalid BETWEEN clause format")
+		return
+	}
+
+	binName := strings.TrimSpace(whereClause[:betweenIdx])
+	lowerStr := strings.TrimSpace(whereClause[betweenIdx+9 : andIdx])
+	upperStr := strings.TrimSpace(whereClause[andIdx+5:])
+
+	lower := c.parseValue(lowerStr)
+	upper := c.parseValue(upperStr)
+
+	var lowerInt, upperInt int64
+	switch v := lower.(type) {
+	case int64:
+		lowerInt = v
+	case int:
+		lowerInt = int64(v)
+	case float64:
+		lowerInt = int64(v)
+	default:
+		fmt.Printf("Error: Lower bound must be numeric, got %T\n", lower)
+		return
+	}
+
+	switch v := upper.(type) {
+	case int64:
+		upperInt = v
+	case int:
+		upperInt = int64(v)
+	case float64:
+		upperInt = int64(v)
+	default:
+		fmt.Printf("Error: Upper bound must be numeric, got %T\n", upper)
+		return
+	}
+
+	stmt := aero.NewStatement(namespace, set)
+	stmt.SetFilter(aero.NewRangeFilter(binName, lowerInt, upperInt))
+
+	policy := c.getQueryPolicy()
+	
+	fmt.Printf("\nExecuting UDF '%s.%s' on range query where %s BETWEEN %v AND %v\n", 
+		module, function, binName, lowerInt, upperInt)
+	fmt.Println("----------------------------------------")
+
+	task, err := c.client.ExecuteUDF(policy, stmt, module, function, args...)
+	if err != nil {
+		c.logError("Background UDF execution failed", err)
+		return
+	}
+
+	fmt.Println("Background job initiated")
+	fmt.Print("Waiting for completion")
+
+	for {
+		done, err := task.IsDone()
+		if err != nil {
+			c.logError("Error checking task status", err)
+			return
+		}
+		if done {
+			break
+		}
+		fmt.Print(".")
+		time.Sleep(500 * time.Millisecond)
+	}
+
+	fmt.Println("\n\nUDF execution completed successfully")
+}
+
+func (c *CLI) executeUDFScan(namespace, set, module, function string, args []aero.Value) {
+	stmt := aero.NewStatement(namespace, set)
+
+	policy := c.getQueryPolicy()
+	
+	fmt.Printf("\nExecuting background UDF '%s.%s' on namespace='%s'", module, function, namespace)
+	if set != "" {
+		fmt.Printf(", set='%s'", set)
+	}
+	fmt.Println()
+	fmt.Println("----------------------------------------")
+
+	task, err := c.client.ExecuteUDF(policy, stmt, module, function, args...)
+	if err != nil {
+		c.logError("Background UDF execution failed", err)
+		return
+	}
+
+	fmt.Println("Background job initiated")
+	fmt.Print("Waiting for completion")
+
+	for {
+		done, err := task.IsDone()
+		if err != nil {
+			c.logError("Error checking task status", err)
+			return
+		}
+		if done {
+			break
+		}
+		fmt.Print(".")
+		time.Sleep(500 * time.Millisecond)
+	}
+
+	fmt.Println("\n\nUDF execution completed successfully")
 }
 
 func (c *CLI) handleBatchPut(args []string) {
@@ -659,6 +1207,22 @@ func (c *CLI) parseValue(s string) interface{} {
 
 func (c *CLI) printRecord(key *aero.Key, record *aero.Record) {
 	fmt.Printf("\nKey: %v\n", key.Value())
+	fmt.Printf("Digest: %x\n", key.Digest())
+	fmt.Printf("Generation: %d, Expiration: %d\n", record.Generation, record.Expiration)
+	fmt.Println("Bins:")
+	for name, value := range record.Bins {
+		fmt.Printf("  %s: %v (%T)\n", name, value, value)
+	}
+}
+
+func (c *CLI) printRecordWithMetadata(key *aero.Key, record *aero.Record) {
+	fmt.Printf("\nKey: %v\n", key.Value())
+	fmt.Printf("Digest: %x\n", key.Digest())
+	
+	// Get partition information
+	partition := key.PartitionId()
+	fmt.Printf("Partition ID: %d\n", partition)
+	
 	fmt.Printf("Generation: %d, Expiration: %d\n", record.Generation, record.Expiration)
 	fmt.Println("Bins:")
 	for name, value := range record.Bins {
