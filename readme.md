@@ -12,6 +12,7 @@ A powerful command-line interface for interacting with Aerospike databases. This
 - **Configurable Policies** - Socket timeout, total timeout, max retries, connect timeout
 - **Debug Mode** - Detailed error codes and messages
 - **Dynamic Configuration** - Change namespace/set on the fly
+- **UDF Support** - Register, list, execute, and remove User Defined Functions
 
 ## Prerequisites
 
@@ -110,11 +111,43 @@ aerospike> put user1 name=John age=30 city=NYC
 aerospike> get user1
 ```
 
+The output includes:
+- Key value
+- 20-byte digest (hexadecimal)
+- Partition ID
+- Master node name and address
+- Replica nodes (if in a cluster)
+- Generation and expiration
+- All bins with their values and types
+
+Example output:
+```
+Key: user1
+Digest: 0a1b2c3d4e5f6789abcdef0123456789abcdef01
+Partition ID: 1523
+Master Node: BB9020011AC4202 (192.168.1.10:3000)
+Replica Nodes: BB9020011AC4203 (192.168.1.11:3000)
+Generation: 2, Expiration: 123456
+Bins:
+  name: John (string)
+  age: 30 (int64)
+```
+
 #### Delete a Record
 
 ```bash
 aerospike> delete user1
 ```
+
+#### Delete by Digest
+
+Delete a record using its 20-byte digest (useful when you don't have the original key):
+
+```bash
+aerospike> delete-digest 0a1b2c3d4e5f6789abcdef0123456789abcdef01
+```
+
+The digest should be provided as a 40-character hexadecimal string. Spaces, colons, and hyphens are automatically removed.
 
 ### Secondary Index Operations
 
@@ -155,6 +188,69 @@ aerospike> query name John
 Scan all records in the current namespace/set:
 ```bash
 aerospike> scan
+```
+
+### UDF (User Defined Functions)
+
+#### Register a UDF Module
+
+Register a Lua UDF file:
+```bash
+aerospike> register-udf /path/to/myudf.lua
+```
+
+Register with custom server filename:
+```bash
+aerospike> register-udf /path/to/myudf.lua custom_name.lua
+```
+
+#### List Registered UDFs
+
+View all registered UDF modules:
+```bash
+aerospike> list-udfs
+```
+
+#### Execute UDF
+
+The `execute-udf` command supports multiple execution modes with SQL-like syntax:
+
+**Execute on a single record (returns result):**
+```bash
+aerospike> execute-udf myudf.increment(salary,1000) ON test.users WHERE PK = user1
+```
+
+**Execute on query results (background operation):**
+```bash
+aerospike> execute-udf myudf.process(status,active) ON test.users WHERE age = 30
+```
+
+**Execute on range query (background operation):**
+```bash
+aerospike> execute-udf myudf.adjust(field,value) ON test.users WHERE age BETWEEN 25 AND 35
+```
+
+**Execute on all records in namespace/set (background operation):**
+```bash
+aerospike> execute-udf myudf.updateAll(flag,true) ON test.users
+```
+
+**Syntax:**
+```
+execute-udf <module>.<function>(<arg1>,<arg2>,...) ON <namespace>[.<set>] [WHERE clause]
+
+WHERE clause options:
+  - WHERE PK = <key>                       (single record by primary key)
+  - WHERE <bin> = <value>                  (query by indexed bin)
+  - WHERE <bin> BETWEEN <lower> AND <upper> (range query)
+  - (no WHERE clause)                      (all records - background scan)
+```
+
+#### Remove a UDF Module
+
+Remove a registered UDF:
+```bash
+aerospike> remove-udf myudf.lua
 ```
 
 ### Batch Operations
@@ -246,6 +342,20 @@ Example:
 aerospike> put record1 count=100 price=19.99 active=true name=Product
 ```
 
+## Cluster Information
+
+When using the `get` command, the CLI displays cluster topology information:
+
+- **Partition ID**: The partition where the record resides (0-4095)
+- **Master Node**: The node currently holding the master copy with node name and address
+- **Replica Nodes**: Other nodes in the cluster holding replica copies
+
+This information is useful for:
+- Understanding data distribution across the cluster
+- Debugging replication issues
+- Capacity planning and load balancing
+- Verifying rack-aware or data-center-aware configurations
+
 ## Debug Mode
 
 When debug mode is enabled (via `-d` flag or `config set debug true`), the client displays detailed error information including:
@@ -260,6 +370,221 @@ ERROR: Put failed
   ResultCode: KEY_NOT_FOUND_ERROR
   Message: Key not found
   InDoubt: false
+```
+
+## Example Workflow
+
+Here's a complete example workflow:
+
+```bash
+# Start the client
+./aerospike-cli -h localhost -p 3000 -n test -d
+
+# Create a secondary index on age
+aerospike> create-index idx_age age numeric
+
+# Insert some records
+aerospike> put user1 name=Alice age=25 city=NYC salary=50000
+aerospike> put user2 name=Bob age=30 city=LA salary=60000
+aerospike> put user3 name=Charlie age=25 city=SF salary=55000
+
+# Query by age
+aerospike> query age 25
+
+# Register a UDF (assuming you have increment.lua)
+aerospike> register-udf /path/to/increment.lua
+
+# List registered UDFs
+aerospike> list-udfs
+
+# Execute UDF on a single record (gets immediate result)
+aerospike> execute-udf increment.add_value(salary,5000) ON test.users WHERE PK = user1
+
+# Execute UDF on query results (background operation)
+aerospike> execute-udf increment.add_value(salary,2000) ON test.users WHERE age = 25
+
+# Execute UDF on range (background operation)
+aerospike> execute-udf increment.add_value(bonus,500) ON test.users WHERE age BETWEEN 25 AND 30
+
+# Execute background UDF on all records
+aerospike> execute-udf increment.add_value(bonus,1000) ON test.users
+
+# Batch read
+aerospike> batch-get user1 user2 user3
+
+# Update a record
+aerospike> put user1 name=Alice age=26 city=NYC
+
+# Delete a record
+aerospike> delete user3
+
+# Scan all records
+aerospike> scan
+
+# Remove UDF
+aerospike> remove-udf increment.lua
+
+# Drop the index
+aerospike> drop-index idx_age
+
+# Exit
+aerospike> exit
+```
+
+## Sample UDF Files
+
+### Example 1: Simple Increment UDF (increment.lua)
+
+```lua
+-- Function to add a value to a bin
+function add_value(rec, bin_name, value)
+    if not aerospike:exists(rec) then
+        return 0
+    end
+    
+    local current = rec[bin_name] or 0
+    rec[bin_name] = current + value
+    
+    aerospike:update(rec)
+    return rec[bin_name]
+end
+
+-- Function to increment a counter
+function increment_counter(rec, bin_name)
+    return add_value(rec, bin_name, 1)
+end
+```
+
+### Example 2: Record Processing UDF (process.lua)
+
+```lua
+-- Process record based on action
+function processRecord(rec, action, bin_name, value)
+    if not aerospike:exists(rec) then
+        return nil
+    end
+    
+    if action == "multiply" then
+        rec[bin_name] = rec[bin_name] * value
+    elseif action == "add" then
+        rec[bin_name] = rec[bin_name] + value
+    elseif action == "set" then
+        rec[bin_name] = value
+    end
+    
+    aerospike:update(rec)
+    return rec[bin_name]
+end
+
+-- Update status for all records (for background scan)
+function updateStatus(rec, status_bin, new_status)
+    if not aerospike:exists(rec) then
+        return nil
+    end
+    
+    rec[status_bin] = new_status
+    rec["last_updated"] = os.time()
+    
+    aerospike:update(rec)
+    return 1
+end
+
+-- Get record info as a map
+function getInfo(rec)
+    local result = map()
+    result["digest"] = record.digest(rec)
+    result["gen"] = record.gen(rec)
+    result["ttl"] = record.ttl(rec)
+    return result
+end
+```
+
+### Example 3: Aggregation UDF (aggregate.lua)
+
+```lua
+-- Stream UDF for aggregation
+function sum_values(stream, bin_name)
+    local function map_record(rec)
+        return rec[bin_name] or 0
+    end
+    
+    local function reduce_values(v1, v2)
+        return v1 + v2
+    end
+    
+    return stream : map(map_record) : reduce(reduce_values)
+end
+
+-- Count records matching a condition
+function count_above_threshold(stream, bin_name, threshold)
+    local function filter_record(rec)
+        return rec[bin_name] > threshold
+    end
+    
+    local function map_to_one(rec)
+        return 1
+    end
+    
+    local function sum(v1, v2)
+        return v1 + v2
+    end
+    
+    return stream : filter(filter_record) : map(map_to_one) : reduce(sum)
+end
+```
+
+## Using UDFs - Step by Step
+
+### 1. Create Your UDF File
+
+Create a file named `myudf.lua`:
+
+```lua
+function add_bonus(rec, bin_name, bonus_amount)
+    if not aerospike:exists(rec) then
+        return 0
+    end
+    
+    local current = rec[bin_name] or 0
+    rec[bin_name] = current + bonus_amount
+    
+    aerospike:update(rec)
+    return rec[bin_name]
+end
+```
+
+### 2. Register the UDF
+
+```bash
+aerospike> register-udf /path/to/myudf.lua
+```
+
+### 3. Execute on Different Scopes
+
+**Single record (with result):**
+```bash
+aerospike> execute-udf myudf.add_bonus(salary,1000) ON test.users WHERE PK = user1
+```
+
+**Query results (background):**
+```bash
+aerospike> execute-udf myudf.add_bonus(salary,500) ON test.users WHERE age = 30
+```
+
+**Range query (background):**
+```bash
+aerospike> execute-udf myudf.add_bonus(salary,200) ON test.users WHERE age BETWEEN 25 AND 35
+```
+
+**All records (background):**
+```bash
+aerospike> execute-udf myudf.add_bonus(bonus,100) ON test.users
+```
+
+### 4. Verify Changes
+
+```bash
+aerospike> get user1
 ```
 
 ## Example Workflow
@@ -319,6 +644,26 @@ If queries fail:
 2. Create the index using `create-index` command
 3. Verify the index type matches the data type (numeric vs string)
 
+### UDF Issues
+
+If UDF operations fail:
+
+1. **Registration fails**: 
+   - Verify the Lua file exists and is readable
+   - Check for syntax errors in the Lua code
+   - Ensure the file path is correct
+
+2. **Execution fails**:
+   - Verify the UDF is registered using `list-udfs`
+   - Check that function name matches exactly (case-sensitive)
+   - Ensure module name matches the registered filename
+   - Verify arguments match the function signature
+
+3. **Query-UDF returns no results**:
+   - Make sure records match the query criteria
+   - Verify the UDF function returns a value
+   - Check that the UDF doesn't have runtime errors
+
 ### Timeout Errors
 
 If you encounter timeout errors:
@@ -326,6 +671,16 @@ If you encounter timeout errors:
 1. Increase socket timeout: `config set socket-timeout 60000`
 2. Increase total timeout: `config set total-timeout 60000`
 3. Check network connectivity and server load
+4. For scan-touch operations on large datasets, timeouts are normal - the operation continues on the server
+
+### Scan-Touch Operations
+
+For large datasets:
+
+1. **Progress monitoring** - Shows progress every 1000 records
+2. **Errors are logged** - Individual record failures don't stop the scan
+3. **Confirmation required** - Prevents accidental bulk operations
+4. **Enable debug mode** - See detailed errors: `config set debug true`
 
 ### Build Errors
 
@@ -336,6 +691,47 @@ If you encounter build errors:
 3. Check for the correct Aerospike client version: `go get github.com/aerospike/aerospike-client-go/v7`
 
 ## Advanced Usage
+
+### UDF Execution Patterns
+
+The unified `execute-udf` command supports four execution patterns:
+
+**1. Single Record Execution (Synchronous with Result)**
+```bash
+aerospike> execute-udf myudf.getValue(field) ON test.users WHERE PK = user123
+```
+- Returns the UDF result immediately
+- Best for single record operations where you need the return value
+
+**2. Query Execution (Background)**
+```bash
+aerospike> execute-udf myudf.update(status,active) ON test.users WHERE age = 30
+```
+- Runs as a background job on the server
+- Executes on all records matching the query filter
+- Requires a secondary index on the queried bin
+
+**3. Range Query Execution (Background)**
+```bash
+aerospike> execute-udf myudf.adjust(discount,0.1) ON test.users WHERE age BETWEEN 18 AND 65
+```
+- Runs as a background job
+- Executes on records within the specified range
+- Requires a secondary index on the range bin
+
+**4. Scan Execution (Background)**
+```bash
+aerospike> execute-udf myudf.migrate(version,2) ON test.users
+```
+- Runs as a background job
+- Executes on ALL records in the namespace/set
+- No index required
+
+**Use cases for background UDFs:**
+- Bulk updates across many records
+- Data migration or transformation
+- Applying business rules to filtered datasets
+- Setting default values on existing records
 
 ### Multiple Bins in Batch Write
 
@@ -387,6 +783,8 @@ For issues related to:
 Feel free to extend this tool with additional features such as:
 - Range queries
 - CDT (Collection Data Type) operations
-- UDF (User Defined Function) execution
+- More complex UDF examples
 - Statistics and monitoring commands
 - Export/import functionality
+- Scan with UDF execution
+- Background query operations
