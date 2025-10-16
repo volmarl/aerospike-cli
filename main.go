@@ -21,6 +21,22 @@ type Config struct {
 	TotalTimeout   time.Duration
 	MaxRetries     int
 	ConnectTimeout time.Duration
+	
+	// Write Policies
+	RecordExistsAction string // UPDATE, UPDATE_ONLY, REPLACE, REPLACE_ONLY, CREATE_ONLY
+	GenerationPolicy   string // NONE, EXPECT_GEN_EQUAL, EXPECT_GEN_GT
+	Generation         uint32
+	Expiration         int32  // TTL in seconds, -1=never expire, -2=namespace default, 0=use default
+	DurableDelete      bool
+	SendKey            bool   // Store user key on server
+	
+	// Read Policies
+	ReadModeAP   string // ONE, ALL
+	ReadModeSC   string // SESSION, LINEARIZE, ALLOW_REPLICA, ALLOW_UNAVAILABLE
+	Replica      string // MASTER, MASTER_PROLES, RANDOM, SEQUENCE, PREFER_RACK
+	
+	// Commit Level
+	CommitLevel string // COMMIT_ALL, COMMIT_MASTER
 }
 
 type CLI struct {
@@ -56,6 +72,22 @@ func parseArgs() *Config {
 		TotalTimeout:   0,
 		MaxRetries:     2,
 		ConnectTimeout: 1 * time.Second,
+		
+		// Write Policy defaults
+		RecordExistsAction: "UPDATE",
+		GenerationPolicy:   "NONE",
+		Generation:         0,
+		Expiration:         0,
+		DurableDelete:      false,
+		SendKey:            false,
+		
+		// Read Policy defaults
+		ReadModeAP:   "ONE",
+		ReadModeSC:   "SESSION",
+		Replica:      "SEQUENCE",
+		
+		// Commit Level default
+		CommitLevel: "COMMIT_ALL",
 	}
 
 	args := os.Args[1:]
@@ -199,6 +231,8 @@ func (c *CLI) handleCommand(line string) {
 		c.handleDelete(parts[1:])
 	case "delete-digest":
 		c.handleDeleteDigest(parts[1:])
+	case "debug-record-meta":
+		c.handleDebugRecordMeta(parts[1:])
 	case "query":
 		c.handleQuery(parts[1:])
 	case "scan":
@@ -209,6 +243,8 @@ func (c *CLI) handleCommand(line string) {
 		c.handleCreateIndex(parts[1:])
 	case "drop-index":
 		c.handleDropIndex(parts[1:])
+	case "show-indexes", "show-sindex":
+		c.handleShowIndexes(parts[1:])
 	case "register-udf":
 		c.handleRegisterUDF(parts[1:])
 	case "list-udfs":
@@ -244,6 +280,8 @@ func (c *CLI) printHelp() {
 	fmt.Println("      Delete a record by primary key")
 	fmt.Println("  delete-digest <digest>")
 	fmt.Println("      Delete a record by its 20-byte digest (hex string)")
+	fmt.Println("  debug-record-meta <digest>")
+	fmt.Println("      Show detailed record metadata (no bin data)")
 	fmt.Println("  scan")
 	fmt.Println("      Scan all records in current namespace/set")
 	fmt.Println("  scan-touch")
@@ -252,6 +290,8 @@ func (c *CLI) printHelp() {
 	fmt.Println("\nSecondary Index Operations:")
 	fmt.Println("  create-index <name> <bin> <type>")
 	fmt.Println("      Create secondary index (type: numeric or string)")
+	fmt.Println("  show-indexes")
+	fmt.Println("      List all secondary indexes with details")
 	fmt.Println("  drop-index <name>")
 	fmt.Println("      Drop secondary index")
 	fmt.Println("  query <bin> <value>")
@@ -435,6 +475,207 @@ func (c *CLI) handleDeleteDigest(args []string) {
 		fmt.Printf("Record with digest %s deleted successfully\n", digestHex)
 	} else {
 		fmt.Printf("Record with digest %s did not exist\n", digestHex)
+	}
+}
+
+func (c *CLI) handleDebugRecordMeta(args []string) {
+	if len(args) < 1 {
+		fmt.Println("Usage: debug-record-meta <digest>")
+		fmt.Println("Example: debug-record-meta 0a1b2c3d4e5f6789abcdef0123456789abcdef01")
+		fmt.Println("\nThe digest must be a 40-character hexadecimal string (20 bytes)")
+		fmt.Println("Returns record metadata including XDR write flag, replication status, and tombstone flag")
+		return
+	}
+
+	digestHex := args[0]
+	
+	// Remove any spaces or separators
+	digestHex = strings.ReplaceAll(digestHex, " ", "")
+	digestHex = strings.ReplaceAll(digestHex, ":", "")
+	digestHex = strings.ReplaceAll(digestHex, "-", "")
+	
+	// Validate hex string length
+	if len(digestHex) != 40 {
+		fmt.Printf("Error: Digest must be exactly 40 hexadecimal characters (got %d)\n", len(digestHex))
+		return
+	}
+	
+	// Convert to uppercase for the info command
+	digestHex = strings.ToUpper(digestHex)
+
+	// Get a node to query
+	nodes := c.client.GetNodes()
+	if len(nodes) == 0 {
+		fmt.Println("Error: No nodes available")
+		return
+	}
+	node := nodes[0]
+
+	// Build the info command for debug-record-meta
+	// Format: debug-record-meta:namespace=<ns>;keyd=<digest_hex>;
+	infoCmd := fmt.Sprintf("debug-record-meta:namespace=%s;keyd=%s;", c.config.Namespace, digestHex)
+	if c.config.Set != "" {
+		infoCmd = fmt.Sprintf("debug-record-meta:namespace=%s;set=%s;keyd=%s;", 
+			c.config.Namespace, c.config.Set, digestHex)
+	}
+
+	// Execute info command with a policy
+	policy := aero.NewInfoPolicy()
+	infoMap, err := node.RequestInfo(policy, infoCmd)
+	if err != nil {
+		c.logError("Failed to retrieve record metadata", err)
+		return
+	}
+
+	result, exists := infoMap[infoCmd]
+	if !exists || result == "" {
+		fmt.Println("No metadata returned from server")
+		return
+	}
+
+	if strings.Contains(result, "ERROR") || strings.Contains(result, "NOT_FOUND") {
+		fmt.Printf("Record with digest %s not found or error occurred\n", digestHex)
+		if c.config.Debug {
+			fmt.Printf("Server response: %s\n", result)
+		}
+		return
+	}
+
+	// Parse the result
+	// Format: pid=<pid>;repl-ix=<idx>;index=rc=0,tree-id=1,...;key=...;n-bins=<n>;bins=...
+	fmt.Println("\nRecord Metadata:")
+	fmt.Println("========================================")
+	fmt.Printf("Digest (keyd): %s\n", digestHex)
+	fmt.Printf("Namespace: %s\n", c.config.Namespace)
+	if c.config.Set != "" {
+		fmt.Printf("Set: %s\n", c.config.Set)
+	}
+	fmt.Println("----------------------------------------")
+	
+	// Parse the response - split by semicolon for major sections
+	sections := strings.Split(result, ";")
+	
+	metadata := make(map[string]string)
+	indexMetadata := make(map[string]string)
+	
+	for _, section := range sections {
+		section = strings.TrimSpace(section)
+		if section == "" {
+			continue
+		}
+		
+		// Check if this is the index section
+		if strings.HasPrefix(section, "index=") {
+			// Parse index metadata
+			indexData := strings.TrimPrefix(section, "index=")
+			pairs := strings.Split(indexData, ",")
+			for _, pair := range pairs {
+				kv := strings.SplitN(pair, "=", 2)
+				if len(kv) == 2 {
+					indexMetadata[kv[0]] = kv[1]
+				}
+			}
+		} else if strings.HasPrefix(section, "key=") {
+			metadata["key"] = strings.TrimPrefix(section, "key=")
+		} else if strings.HasPrefix(section, "n-bins=") {
+			metadata["n-bins"] = strings.TrimPrefix(section, "n-bins=")
+		} else if strings.HasPrefix(section, "bins=") {
+			metadata["bins"] = strings.TrimPrefix(section, "bins=")
+		} else {
+			// Simple key=value pair
+			kv := strings.SplitN(section, "=", 2)
+			if len(kv) == 2 {
+				metadata[kv[0]] = kv[1]
+			}
+		}
+	}
+	
+	// Display core metadata
+	if gen, ok := indexMetadata["generation"]; ok {
+		fmt.Printf("Generation: %s\n", gen)
+	}
+	if vt, ok := indexMetadata["void-time"]; ok {
+		fmt.Printf("Void Time (Expiration): %s\n", vt)
+	}
+	if lut, ok := indexMetadata["lut"]; ok {
+		fmt.Printf("Last Update Time: %s", lut)
+		// Convert Aerospike epoch (citrusleaf epoch) to readable time
+		// Aerospike epoch starts at 2010-01-01 00:00:00 UTC
+		if lutVal, err := strconv.ParseInt(lut, 10, 64); err == nil {
+			// Convert from milliseconds to seconds and add to Aerospike epoch
+			aerospikeEpoch := time.Date(2010, 1, 1, 0, 0, 0, 0, time.UTC)
+			recordTime := aerospikeEpoch.Add(time.Duration(lutVal) * time.Millisecond)
+			fmt.Printf(" (%s)\n", recordTime.Format("2006-01-02 15:04:05 MST"))
+		} else {
+			fmt.Println()
+		}
+	}
+	if nBins, ok := metadata["n-bins"]; ok {
+		fmt.Printf("Number of Bins: %s\n", nBins)
+	}
+	if setName, ok := indexMetadata["set-name"]; ok {
+		fmt.Printf("Set Name: %s\n", setName)
+	}
+	
+	// XDR and replication flags
+	fmt.Println("----------------------------------------")
+	fmt.Println("Flags:")
+	if xdrWrite, ok := indexMetadata["xdr-write"]; ok {
+		fmt.Printf("  XDR Write: %s\n", xdrWrite)
+	}
+	if xdrTombstone, ok := indexMetadata["xdr-tombstone"]; ok {
+		fmt.Printf("  XDR Tombstone: %s\n", xdrTombstone)
+	}
+	if xdrNsupTombstone, ok := indexMetadata["xdr-nsup-tombstone"]; ok {
+		fmt.Printf("  XDR NSUP Tombstone: %s\n", xdrNsupTombstone)
+	}
+	if tombstone, ok := indexMetadata["tombstone"]; ok {
+		fmt.Printf("  Tombstone: %s\n", tombstone)
+	}
+	if cenotaph, ok := indexMetadata["cenotaph"]; ok {
+		fmt.Printf("  Cenotaph: %s\n", cenotaph)
+	}
+	if replState, ok := indexMetadata["repl-state"]; ok {
+		fmt.Printf("  Replication State: %s\n", replState)
+	}
+	if keyStored, ok := indexMetadata["key-stored"]; ok {
+		fmt.Printf("  Key Stored: %s\n", keyStored)
+	}
+	
+	// Index information
+	fmt.Println("----------------------------------------")
+	fmt.Println("Index Information:")
+	if pid, ok := metadata["pid"]; ok {
+		fmt.Printf("  Partition ID: %s\n", pid)
+	}
+	if replIx, ok := metadata["repl-ix"]; ok {
+		fmt.Printf("  Replica Index: %s\n", replIx)
+	}
+	if treeId, ok := indexMetadata["tree-id"]; ok {
+		fmt.Printf("  Tree ID: %s\n", treeId)
+	}
+	if rc, ok := indexMetadata["rc"]; ok {
+		fmt.Printf("  Reference Count: %s\n", rc)
+	}
+	
+	// Storage information
+	if rblockId, ok := indexMetadata["rblock-id"]; ok && rblockId != "0" {
+		fmt.Println("----------------------------------------")
+		fmt.Println("Storage Information:")
+		fmt.Printf("  RBlock ID: %s\n", rblockId)
+		if nRblocks, ok := indexMetadata["n-rblocks"]; ok {
+			fmt.Printf("  Number of RBlocks: %s\n", nRblocks)
+		}
+		if fileId, ok := indexMetadata["file-id"]; ok {
+			fmt.Printf("  File ID: %s\n", fileId)
+		}
+	}
+	
+	fmt.Println("========================================")
+	
+	if c.config.Debug {
+		fmt.Println("\nRaw Response:")
+		fmt.Println(result)
 	}
 }
 
@@ -631,6 +872,83 @@ func (c *CLI) handleDropIndex(args []string) {
 	}
 
 	fmt.Printf("Secondary index '%s' dropped successfully\n", indexName)
+}
+
+func (c *CLI) handleShowIndexes(args []string) {
+	// Get all nodes in the cluster
+	nodes := c.client.GetNodes()
+	if len(nodes) == 0 {
+		fmt.Println("No nodes available in cluster")
+		return
+	}
+
+	// Query index information from the first node
+	node := nodes[0]
+	
+	// Use Info command to get sindex information
+	policy := aero.NewInfoPolicy()
+	infoMap, err := node.RequestInfo(policy, "sindex")
+	if err != nil {
+		c.logError("Failed to retrieve index information", err)
+		return
+	}
+
+	sindexInfo, exists := infoMap["sindex"]
+	if !exists || sindexInfo == "" {
+		fmt.Println("No secondary indexes found")
+		return
+	}
+
+	// Parse the sindex response
+	// Format: ns=<namespace>:set=<set>:indexname=<name>:num_bins=1:bins=<bin>:type=<type>:indextype=<indextype>:state=<state>;...
+	indexes := strings.Split(sindexInfo, ";")
+	
+	if len(indexes) == 0 || (len(indexes) == 1 && indexes[0] == "") {
+		fmt.Println("No secondary indexes found")
+		return
+	}
+
+	fmt.Println("\nSecondary Indexes:")
+	fmt.Println("========================================")
+	
+	count := 0
+	for _, indexStr := range indexes {
+		if strings.TrimSpace(indexStr) == "" {
+			continue
+		}
+		
+		count++
+		indexData := make(map[string]string)
+		
+		// Parse key=value pairs
+		pairs := strings.Split(indexStr, ":")
+		for _, pair := range pairs {
+			kv := strings.SplitN(pair, "=", 2)
+			if len(kv) == 2 {
+				indexData[kv[0]] = kv[1]
+			}
+		}
+		
+		// Display index information
+		fmt.Printf("\n[%d] Index: %s\n", count, indexData["indexname"])
+		fmt.Printf("    Namespace: %s\n", indexData["ns"])
+		if set, exists := indexData["set"]; exists && set != "NULL" {
+			fmt.Printf("    Set:       %s\n", set)
+		} else {
+			fmt.Printf("    Set:       (none)\n")
+		}
+		fmt.Printf("    Bin:       %s\n", indexData["bins"])
+		fmt.Printf("    Type:      %s\n", indexData["type"])
+		fmt.Printf("    State:     %s\n", indexData["state"])
+		
+		// Show index type if available
+		if indexType, exists := indexData["indextype"]; exists {
+			fmt.Printf("    IndexType: %s\n", indexType)
+		}
+	}
+	
+	fmt.Printf("\nTotal indexes: %d\n", count)
+	fmt.Println("========================================")
 }
 
 func (c *CLI) handleRegisterUDF(args []string) {
@@ -1092,15 +1410,32 @@ func (c *CLI) handleBatchGet(args []string) {
 func (c *CLI) handleConfig(args []string) {
 	if len(args) == 0 || args[0] == "show" {
 		fmt.Println("\nCurrent Configuration:")
+		fmt.Println("\n--- Connection ---")
 		fmt.Printf("  Host:            %s\n", c.config.Host)
 		fmt.Printf("  Port:            %d\n", c.config.Port)
 		fmt.Printf("  Namespace:       %s\n", c.config.Namespace)
 		fmt.Printf("  Set:             %s\n", c.config.Set)
 		fmt.Printf("  Debug:           %v\n", c.config.Debug)
+		
+		fmt.Println("\n--- Timeout Policies ---")
 		fmt.Printf("  SocketTimeout:   %v\n", c.config.SocketTimeout)
 		fmt.Printf("  TotalTimeout:    %v\n", c.config.TotalTimeout)
-		fmt.Printf("  MaxRetries:      %d\n", c.config.MaxRetries)
 		fmt.Printf("  ConnectTimeout:  %v\n", c.config.ConnectTimeout)
+		fmt.Printf("  MaxRetries:      %d\n", c.config.MaxRetries)
+		
+		fmt.Println("\n--- Write Policies ---")
+		fmt.Printf("  RecordExistsAction: %s\n", c.config.RecordExistsAction)
+		fmt.Printf("  GenerationPolicy:   %s\n", c.config.GenerationPolicy)
+		fmt.Printf("  Generation:         %d\n", c.config.Generation)
+		fmt.Printf("  Expiration:         %d\n", c.config.Expiration)
+		fmt.Printf("  DurableDelete:      %v\n", c.config.DurableDelete)
+		fmt.Printf("  SendKey:            %v\n", c.config.SendKey)
+		fmt.Printf("  CommitLevel:        %s\n", c.config.CommitLevel)
+		
+		fmt.Println("\n--- Read Policies ---")
+		fmt.Printf("  ReadModeAP:      %s\n", c.config.ReadModeAP)
+		fmt.Printf("  ReadModeSC:      %s\n", c.config.ReadModeSC)
+		fmt.Printf("  Replica:         %s\n", c.config.Replica)
 		return
 	}
 
@@ -1124,6 +1459,70 @@ func (c *CLI) handleConfig(args []string) {
 			retries, _ := strconv.Atoi(value)
 			c.config.MaxRetries = retries
 			fmt.Printf("MaxRetries set to: %d\n", c.config.MaxRetries)
+		case "record-exists-action":
+			upper := strings.ToUpper(value)
+			if upper == "UPDATE" || upper == "UPDATE_ONLY" || upper == "REPLACE" || 
+			   upper == "REPLACE_ONLY" || upper == "CREATE_ONLY" {
+				c.config.RecordExistsAction = upper
+				fmt.Printf("RecordExistsAction set to: %s\n", c.config.RecordExistsAction)
+			} else {
+				fmt.Println("Invalid value. Use: UPDATE, UPDATE_ONLY, REPLACE, REPLACE_ONLY, CREATE_ONLY")
+			}
+		case "generation-policy":
+			upper := strings.ToUpper(value)
+			if upper == "NONE" || upper == "EXPECT_GEN_EQUAL" || upper == "EXPECT_GEN_GT" {
+				c.config.GenerationPolicy = upper
+				fmt.Printf("GenerationPolicy set to: %s\n", c.config.GenerationPolicy)
+			} else {
+				fmt.Println("Invalid value. Use: NONE, EXPECT_GEN_EQUAL, EXPECT_GEN_GT")
+			}
+		case "generation":
+			gen, _ := strconv.ParseUint(value, 10, 32)
+			c.config.Generation = uint32(gen)
+			fmt.Printf("Generation set to: %d\n", c.config.Generation)
+		case "expiration", "ttl":
+			exp, _ := strconv.ParseInt(value, 10, 32)
+			c.config.Expiration = int32(exp)
+			fmt.Printf("Expiration (TTL) set to: %d\n", c.config.Expiration)
+		case "durable-delete":
+			c.config.DurableDelete = value == "true"
+			fmt.Printf("DurableDelete set to: %v\n", c.config.DurableDelete)
+		case "send-key":
+			c.config.SendKey = value == "true"
+			fmt.Printf("SendKey set to: %v\n", c.config.SendKey)
+		case "commit-level":
+			upper := strings.ToUpper(value)
+			if upper == "COMMIT_ALL" || upper == "COMMIT_MASTER" {
+				c.config.CommitLevel = upper
+				fmt.Printf("CommitLevel set to: %s\n", c.config.CommitLevel)
+			} else {
+				fmt.Println("Invalid value. Use: COMMIT_ALL, COMMIT_MASTER")
+			}
+		case "read-mode-ap":
+			upper := strings.ToUpper(value)
+			if upper == "ONE" || upper == "ALL" {
+				c.config.ReadModeAP = upper
+				fmt.Printf("ReadModeAP set to: %s\n", c.config.ReadModeAP)
+			} else {
+				fmt.Println("Invalid value. Use: ONE, ALL")
+			}
+		case "read-mode-sc":
+			upper := strings.ToUpper(value)
+			if upper == "SESSION" || upper == "LINEARIZE" || upper == "ALLOW_REPLICA" || upper == "ALLOW_UNAVAILABLE" {
+				c.config.ReadModeSC = upper
+				fmt.Printf("ReadModeSC set to: %s\n", c.config.ReadModeSC)
+			} else {
+				fmt.Println("Invalid value. Use: SESSION, LINEARIZE, ALLOW_REPLICA, ALLOW_UNAVAILABLE")
+			}
+		case "replica":
+			upper := strings.ToUpper(value)
+			if upper == "MASTER" || upper == "MASTER_PROLES" || upper == "RANDOM" || 
+			   upper == "SEQUENCE" || upper == "PREFER_RACK" {
+				c.config.Replica = upper
+				fmt.Printf("Replica set to: %s\n", c.config.Replica)
+			} else {
+				fmt.Println("Invalid value. Use: MASTER, MASTER_PROLES, RANDOM, SEQUENCE, PREFER_RACK")
+			}
 		default:
 			fmt.Printf("Unknown parameter: %s\n", param)
 		}
@@ -1153,10 +1552,51 @@ func (c *CLI) handleUse(args []string) {
 }
 
 func (c *CLI) getWritePolicy() *aero.WritePolicy {
-	policy := aero.NewWritePolicy(0, 0)
+	policy := aero.NewWritePolicy(0, uint32(c.config.Expiration))
 	policy.SocketTimeout = c.config.SocketTimeout
 	policy.TotalTimeout = c.config.TotalTimeout
 	policy.MaxRetries = c.config.MaxRetries
+	
+	// Set RecordExistsAction
+	switch c.config.RecordExistsAction {
+	case "UPDATE":
+		policy.RecordExistsAction = aero.UPDATE
+	case "UPDATE_ONLY":
+		policy.RecordExistsAction = aero.UPDATE_ONLY
+	case "REPLACE":
+		policy.RecordExistsAction = aero.REPLACE
+	case "REPLACE_ONLY":
+		policy.RecordExistsAction = aero.REPLACE_ONLY
+	case "CREATE_ONLY":
+		policy.RecordExistsAction = aero.CREATE_ONLY
+	}
+	
+	// Set GenerationPolicy
+	switch c.config.GenerationPolicy {
+	case "NONE":
+		policy.GenerationPolicy = aero.NONE
+	case "EXPECT_GEN_EQUAL":
+		policy.GenerationPolicy = aero.EXPECT_GEN_EQUAL
+		policy.Generation = c.config.Generation
+	case "EXPECT_GEN_GT":
+		policy.GenerationPolicy = aero.EXPECT_GEN_GT
+		policy.Generation = c.config.Generation
+	}
+	
+	// Set CommitLevel
+	switch c.config.CommitLevel {
+	case "COMMIT_ALL":
+		policy.CommitLevel = aero.COMMIT_ALL
+	case "COMMIT_MASTER":
+		policy.CommitLevel = aero.COMMIT_MASTER
+	}
+	
+	// Set DurableDelete
+	policy.DurableDelete = c.config.DurableDelete
+	
+	// Set SendKey
+	policy.SendKey = c.config.SendKey
+	
 	return policy
 }
 
@@ -1165,6 +1605,41 @@ func (c *CLI) getReadPolicy() *aero.BasePolicy {
 	policy.SocketTimeout = c.config.SocketTimeout
 	policy.TotalTimeout = c.config.TotalTimeout
 	policy.MaxRetries = c.config.MaxRetries
+	
+	// Set Replica
+	switch c.config.Replica {
+	case "MASTER":
+		policy.ReplicaPolicy = aero.MASTER
+	case "MASTER_PROLES":
+		policy.ReplicaPolicy = aero.MASTER_PROLES
+	case "RANDOM":
+		policy.ReplicaPolicy = aero.RANDOM
+	case "SEQUENCE":
+		policy.ReplicaPolicy = aero.SEQUENCE
+	case "PREFER_RACK":
+		policy.ReplicaPolicy = aero.PREFER_RACK
+	}
+	
+	// Set ReadModeAP
+	switch c.config.ReadModeAP {
+	case "ONE":
+		policy.ReadModeAP = aero.ReadModeAPOne
+	case "ALL":
+		policy.ReadModeAP = aero.ReadModeAPAll
+	}
+	
+	// Set ReadModeSC
+	switch c.config.ReadModeSC {
+	case "SESSION":
+		policy.ReadModeSC = aero.ReadModeSCSession
+	case "LINEARIZE":
+		policy.ReadModeSC = aero.ReadModeSCLinearize
+	case "ALLOW_REPLICA":
+		policy.ReadModeSC = aero.ReadModeSCAllowReplica
+	case "ALLOW_UNAVAILABLE":
+		policy.ReadModeSC = aero.ReadModeSCAllowUnavailable
+	}
+	
 	return policy
 }
 
@@ -1173,6 +1648,21 @@ func (c *CLI) getQueryPolicy() *aero.QueryPolicy {
 	policy.SocketTimeout = c.config.SocketTimeout
 	policy.TotalTimeout = c.config.TotalTimeout
 	policy.MaxRetries = c.config.MaxRetries
+	
+	// Set Replica
+	switch c.config.Replica {
+	case "MASTER":
+		policy.ReplicaPolicy = aero.MASTER
+	case "MASTER_PROLES":
+		policy.ReplicaPolicy = aero.MASTER_PROLES
+	case "RANDOM":
+		policy.ReplicaPolicy = aero.RANDOM
+	case "SEQUENCE":
+		policy.ReplicaPolicy = aero.SEQUENCE
+	case "PREFER_RACK":
+		policy.ReplicaPolicy = aero.PREFER_RACK
+	}
+	
 	return policy
 }
 
@@ -1181,6 +1671,21 @@ func (c *CLI) getScanPolicy() *aero.ScanPolicy {
 	policy.SocketTimeout = c.config.SocketTimeout
 	policy.TotalTimeout = c.config.TotalTimeout
 	policy.MaxRetries = c.config.MaxRetries
+	
+	// Set Replica
+	switch c.config.Replica {
+	case "MASTER":
+		policy.ReplicaPolicy = aero.MASTER
+	case "MASTER_PROLES":
+		policy.ReplicaPolicy = aero.MASTER_PROLES
+	case "RANDOM":
+		policy.ReplicaPolicy = aero.RANDOM
+	case "SEQUENCE":
+		policy.ReplicaPolicy = aero.SEQUENCE
+	case "PREFER_RACK":
+		policy.ReplicaPolicy = aero.PREFER_RACK
+	}
+	
 	return policy
 }
 
@@ -1189,6 +1694,21 @@ func (c *CLI) getBatchPolicy() *aero.BatchPolicy {
 	policy.SocketTimeout = c.config.SocketTimeout
 	policy.TotalTimeout = c.config.TotalTimeout
 	policy.MaxRetries = c.config.MaxRetries
+	
+	// Set Replica
+	switch c.config.Replica {
+	case "MASTER":
+		policy.ReplicaPolicy = aero.MASTER
+	case "MASTER_PROLES":
+		policy.ReplicaPolicy = aero.MASTER_PROLES
+	case "RANDOM":
+		policy.ReplicaPolicy = aero.RANDOM
+	case "SEQUENCE":
+		policy.ReplicaPolicy = aero.SEQUENCE
+	case "PREFER_RACK":
+		policy.ReplicaPolicy = aero.PREFER_RACK
+	}
+	
 	return policy
 }
 
@@ -1223,11 +1743,58 @@ func (c *CLI) printRecordWithMetadata(key *aero.Key, record *aero.Record) {
 	partition := key.PartitionId()
 	fmt.Printf("Partition ID: %d\n", partition)
 	
-	fmt.Printf("Generation: %d, Expiration: %d\n", record.Generation, record.Expiration)
+	// Convert expiration to readable format
+	expirationStr := fmt.Sprintf("%d", record.Expiration)
+	if record.Expiration == 0 {
+		expirationStr = "0 (never expires)"
+	} else if record.Expiration == 4294967295 { // Max uint32 - special "never expire" value
+		expirationStr = "4294967295 (never expires)"
+	} else if record.Expiration > 0 {
+		// Aerospike expiration is in seconds since Citrusleaf epoch (2010-01-01)
+		aerospikeEpoch := time.Date(2010, 1, 1, 0, 0, 0, 0, time.UTC)
+		expirationTime := aerospikeEpoch.Add(time.Duration(record.Expiration) * time.Second)
+		
+		// Calculate TTL remaining
+		now := time.Now().UTC()
+		ttlRemaining := expirationTime.Sub(now)
+		
+		if ttlRemaining > 0 {
+			expirationStr = fmt.Sprintf("%d (%s, TTL: %s)", 
+				record.Expiration, 
+				expirationTime.Format("2006-01-02 15:04:05 MST"),
+				formatDuration(ttlRemaining))
+		} else {
+			expirationStr = fmt.Sprintf("%d (%s, expired)", 
+				record.Expiration, 
+				expirationTime.Format("2006-01-02 15:04:05 MST"))
+		}
+	}
+	
+	fmt.Printf("Generation: %d, Expiration: %s\n", record.Generation, expirationStr)
 	fmt.Println("Bins:")
 	for name, value := range record.Bins {
 		fmt.Printf("  %s: %v (%T)\n", name, value, value)
 	}
+}
+
+func formatDuration(d time.Duration) string {
+	if d < 0 {
+		return "expired"
+	}
+	
+	days := int(d.Hours() / 24)
+	hours := int(d.Hours()) % 24
+	minutes := int(d.Minutes()) % 60
+	seconds := int(d.Seconds()) % 60
+	
+	if days > 0 {
+		return fmt.Sprintf("%dd %dh %dm %ds", days, hours, minutes, seconds)
+	} else if hours > 0 {
+		return fmt.Sprintf("%dh %dm %ds", hours, minutes, seconds)
+	} else if minutes > 0 {
+		return fmt.Sprintf("%dm %ds", minutes, seconds)
+	}
+	return fmt.Sprintf("%ds", seconds)
 }
 
 func (c *CLI) logError(msg string, err error) {
