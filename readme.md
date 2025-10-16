@@ -115,8 +115,6 @@ The output includes:
 - Key value
 - 20-byte digest (hexadecimal)
 - Partition ID
-- Master node name and address
-- Replica nodes (if in a cluster)
 - Generation and expiration
 - All bins with their values and types
 
@@ -163,10 +161,9 @@ This command returns:
 - Last update time
 - Number of bins
 - Record size in bytes
-- **XDR write flag** - Whether record needs XDR replication
+- **XDR write flag** - Whether record is an XDR replication
 - **Replicated status** - Replication state
 - **Tombstone flag** - Whether record is marked for deletion
-- **Durable delete flag** - Whether delete was durable
 - Partition ID
 
 **Example output:**
