@@ -149,6 +149,55 @@ aerospike> delete-digest 0a1b2c3d4e5f6789abcdef0123456789abcdef01
 
 The digest should be provided as a 40-character hexadecimal string. Spaces, colons, and hyphens are automatically removed.
 
+#### Debug Record Metadata
+
+Retrieve detailed record metadata without fetching bin data:
+
+```bash
+aerospike> debug-record-meta 0a1b2c3d4e5f6789abcdef0123456789abcdef01
+```
+
+This command returns:
+- Generation number
+- Expiration time
+- Last update time
+- Number of bins
+- Record size in bytes
+- **XDR write flag** - Whether record needs XDR replication
+- **Replicated status** - Replication state
+- **Tombstone flag** - Whether record is marked for deletion
+- **Durable delete flag** - Whether delete was durable
+- Partition ID
+
+**Example output:**
+```
+Record Metadata:
+========================================
+Digest: 0a1b2c3d4e5f6789abcdef0123456789abcdef01
+Namespace: test
+Set: users
+----------------------------------------
+Generation: 5
+Expiration: 1234567890
+Last Update Time: 1234567800
+Number of Bins: 3
+Record Size: 128 bytes
+----------------------------------------
+XDR Write: true
+Replicated: true
+Tombstone: false
+Durable Delete: false
+Partition: 1523
+========================================
+```
+
+**Use cases:**
+- Debugging replication issues
+- Verifying XDR replication status
+- Checking tombstone records
+- Understanding record metadata without reading bin data
+- Troubleshooting data inconsistencies
+
 ### Secondary Index Operations
 
 #### Create a Secondary Index
@@ -161,6 +210,47 @@ aerospike> create-index idx_age age numeric
 Create a string index:
 ```bash
 aerospike> create-index idx_name name string
+```
+
+#### Show All Indexes
+
+List all secondary indexes with their details:
+```bash
+aerospike> show-indexes
+```
+
+This displays:
+- Index name
+- Namespace
+- Set (if applicable)
+- Bin name
+- Data type (NUMERIC or STRING)
+- State (RW = ready, WO = write-only during building)
+- Index type (e.g., NONE for simple indexes)
+
+**Example output:**
+```
+Secondary Indexes:
+========================================
+
+[1] Index: idx_age
+    Namespace: test
+    Set:       users
+    Bin:       age
+    Type:      NUMERIC
+    State:     RW
+    IndexType: NONE
+
+[2] Index: idx_status
+    Namespace: test
+    Set:       (none)
+    Bin:       status
+    Type:      STRING
+    State:     RW
+    IndexType: NONE
+
+Total indexes: 2
+========================================
 ```
 
 #### Drop an Index
@@ -277,21 +367,87 @@ aerospike> batch-get user1 user2 user3
 aerospike> config show
 ```
 
+Displays all current settings organized by category:
+- **Connection**: Host, port, namespace, set, debug mode
+- **Timeout Policies**: Socket, total, and connect timeouts, max retries
+- **Write Policies**: Record exists action, generation policy, expiration/TTL, durable delete, commit level
+- **Read Policies**: Read modes (AP/SC), replica policy
+
 #### Change Configuration at Runtime
 
-Enable debug mode:
 ```bash
-aerospike> config set debug true
+aerospike> config set <parameter> <value>
 ```
 
-Change socket timeout:
-```bash
-aerospike> config set socket-timeout 5000
-```
+**Timeout Parameters:**
+- `socket-timeout <ms>` - Socket timeout in milliseconds
+- `total-timeout <ms>` - Total transaction timeout
+- `max-retries <n>` - Maximum retry attempts
+- `debug <true|false>` - Enable/disable debug mode
 
-Change max retries:
+**Write Policy Parameters:**
+- `record-exists-action <action>` - How to handle existing records
+  - `UPDATE` - Create or update (default)
+  - `UPDATE_ONLY` - Update only if exists
+  - `REPLACE` - Replace entire record
+  - `REPLACE_ONLY` - Replace only if exists
+  - `CREATE_ONLY` - Create only if doesn't exist
+- `generation-policy <policy>` - Generation checking
+  - `NONE` - No generation check (default)
+  - `EXPECT_GEN_EQUAL` - Expect exact generation match
+  - `EXPECT_GEN_GT` - Expect generation greater than
+- `generation <n>` - Expected generation number (use with generation-policy)
+- `expiration <seconds>` or `ttl <seconds>` - Time-to-live
+  - Positive number: TTL in seconds
+  - `0`: Use namespace default (default)
+  - `-1`: Never expire
+  - `-2`: Reset to namespace default
+- `durable-delete <true|false>` - Durable delete (commit to device)
+- `send-key <true|false>` - Store user key on server (enables key retrieval)
+- `commit-level <level>` - Commit level
+  - `COMMIT_ALL` - Wait for all replicas (default)
+  - `COMMIT_MASTER` - Wait for master only
+
+**Read Policy Parameters:**
+- `replica <policy>` - Which replica to read from
+  - `SEQUENCE` - Try sequence of nodes (default)
+  - `MASTER` - Always read from master
+  - `MASTER_PROLES` - Distribute reads across master and proles
+  - `RANDOM` - Distribute reads randomly
+  - `PREFER_RACK` - Prefer local rack
+- `read-mode-ap <mode>` - Availability mode for AP namespaces
+  - `ONE` - Read from one replica (default)
+  - `ALL` - Read from all replicas
+- `read-mode-sc <mode>` - Consistency mode for SC namespaces
+  - `SESSION` - Session consistency (default)
+  - `LINEARIZE` - Linearizable reads
+  - `ALLOW_REPLICA` - Allow replica reads
+  - `ALLOW_UNAVAILABLE` - Allow unavailable reads
+
+**Examples:**
+
 ```bash
-aerospike> config set max-retries 5
+# Enable durable delete for safe deletions
+aerospike> config set durable-delete true
+
+# Store user keys on server (useful for scans without digest)
+aerospike> config set send-key true
+
+# Set TTL to 1 hour for all writes
+aerospike> config set ttl 3600
+
+# Only update existing records
+aerospike> config set record-exists-action UPDATE_ONLY
+
+# Use generation checking for optimistic concurrency control
+aerospike> config set generation-policy EXPECT_GEN_EQUAL
+aerospike> config set generation 5
+
+# Read from master only for strong consistency
+aerospike> config set replica MASTER
+
+# Set commit level to master only for faster writes
+aerospike> config set commit-level COMMIT_MASTER
 ```
 
 #### Switch Namespace/Set
