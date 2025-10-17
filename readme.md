@@ -1,18 +1,21 @@
 # Aerospike Interactive CLI Client
 
-A powerful command-line interface for interacting with Aerospike databases. This tool provides an interactive prompt with command history, full CRUD operations, secondary index management, and batch operations.
+A powerful command-line interface for interacting with Aerospike databases. This tool provides an interactive prompt with command history, full CRUD operations, secondary index management, UDF support, and advanced performance testing capabilities.
 
 ## Features
 
 - **Interactive Prompt** with command history (up/down arrow navigation)
 - **CRUD Operations** - Create, Read, Update, Delete records
-- **Secondary Index Management** - Create and drop indexes
+- **Secondary Index Management** - Create, show, and drop indexes
 - **Query Support** - Query by secondary indexes
 - **Batch Operations** - Batch reads and writes
-- **Configurable Policies** - Socket timeout, total timeout, max retries, connect timeout
+- **UDF Support** - Register, list, execute, and remove User Defined Functions
+- **Advanced Operations** - Delete by digest, scan-touch, debug record metadata
+- **Performance Testing** - Hot key read/write workload generation
+- **Configurable Policies** - Comprehensive policy controls for read/write operations
 - **Debug Mode** - Detailed error codes and messages
 - **Dynamic Configuration** - Change namespace/set on the fly
-- **UDF Support** - Register, list, execute, and remove User Defined Functions
+- **Human-Readable Timestamps** - Automatic conversion of Aerospike epoch times
 
 ## Prerequisites
 
@@ -115,7 +118,7 @@ The output includes:
 - Key value
 - 20-byte digest (hexadecimal)
 - Partition ID
-- Generation and expiration
+- Generation and expiration (with human-readable date/time and TTL remaining)
 - All bins with their values and types
 
 Example output:
@@ -123,9 +126,7 @@ Example output:
 Key: user1
 Digest: 0a1b2c3d4e5f6789abcdef0123456789abcdef01
 Partition ID: 1523
-Master Node: BB9020011AC4202 (192.168.1.10:3000)
-Replica Nodes: BB9020011AC4203 (192.168.1.11:3000)
-Generation: 2, Expiration: 123456
+Generation: 2, Expiration: 439467349 (2023-12-15 10:22:29 UTC, TTL: 5d 3h 45m 20s)
 Bins:
   name: John (string)
   age: 30 (int64)
@@ -157,34 +158,49 @@ aerospike> debug-record-meta 0a1b2c3d4e5f6789abcdef0123456789abcdef01
 
 This command returns:
 - Generation number
-- Expiration time
-- Last update time
+- Void time (expiration)
+- Last update time (with human-readable conversion)
 - Number of bins
-- Record size in bytes
-- **XDR write flag** - Whether record is an XDR replication
-- **Replicated status** - Replication state
+- Set name
+- **XDR write flag** - Whether record needs XDR replication
+- **XDR tombstone** - XDR tombstone status
+- **XDR NSUP tombstone** - NSUP tombstone status
 - **Tombstone flag** - Whether record is marked for deletion
-- Partition ID
+- **Cenotaph flag** - Cenotaph status
+- **Replication state** - Replication state
+- **Key stored** - Whether user key is stored
+- Partition ID and replica index
+- Tree ID and reference count
+- Storage information (rblock-id, n-rblocks, file-id)
 
 **Example output:**
 ```
 Record Metadata:
 ========================================
-Digest: 0a1b2c3d4e5f6789abcdef0123456789abcdef01
+Digest (keyd): F49F36CF2DCA1A4259C571F448F62525C06A8B00
 Namespace: test
-Set: users
+Set: testset
 ----------------------------------------
-Generation: 5
-Expiration: 1234567890
-Last Update Time: 1234567800
-Number of Bins: 3
-Record Size: 128 bytes
+Generation: 1
+Void Time (Expiration): 0
+Last Update Time: 439467349490 (2023-12-15 10:22:29 UTC)
+Number of Bins: 2
+Set Name: testset
 ----------------------------------------
-XDR Write: true
-Replicated: true
-Tombstone: false
-Durable Delete: false
-Partition: 1523
+Flags:
+  XDR Write: 0
+  XDR Tombstone: 0
+  XDR NSUP Tombstone: 0
+  Tombstone: 0
+  Cenotaph: 0
+  Replication State: 0
+  Key Stored: 1
+----------------------------------------
+Index Information:
+  Partition ID: 4084
+  Replica Index: 1
+  Tree ID: 1
+  Reference Count: 0
 ========================================
 ```
 
@@ -277,6 +293,43 @@ Scan all records in the current namespace/set:
 aerospike> scan
 ```
 
+#### Scan and Touch Records
+
+Touch all records in the namespace/set, resetting their TTL to the namespace default:
+```bash
+aerospike> scan-touch
+```
+
+This command:
+- Scans all records in the current namespace/set
+- Touches each record with TTL=-2 (resets to namespace default TTL)
+- Shows progress every 1000 records
+- Requires confirmation before proceeding
+- Displays total touched records and any errors
+
+**Use cases:**
+- Reset expiration times for all records after changing namespace TTL configuration
+- Refresh records that are approaching expiration
+- Bulk TTL management operations
+
+**Example output:**
+```
+This will touch ALL records in namespace 'test', set 'users'
+Each record's TTL will be reset to the namespace default (TTL=-2)
+Are you sure you want to continue? (yes/no): yes
+
+Starting scan-touch operation...
+----------------------------------------
+Touched 1000 records...
+Touched 2000 records...
+Touched 3000 records...
+
+----------------------------------------
+Scan-touch completed
+  Records touched: 3450
+  Errors: 0
+```
+
 ### UDF (User Defined Functions)
 
 #### Register a UDF Module
@@ -356,6 +409,77 @@ Read multiple records at once:
 aerospike> batch-get user1 user2 user3
 ```
 
+### Performance Testing
+
+#### Hot Key Read Workload (hotget)
+
+Generate a high-rate read workload on a single key to test read performance and contention:
+
+```bash
+aerospike> hotget <key> [connections] [duration] [rate]
+```
+
+**Parameters:**
+- `key` - The key to read repeatedly (required)
+- `connections` - Number of concurrent connections (default: 100)
+- `duration` - Test duration in seconds (default: 60)
+- `rate` - Target ops/sec per connection (default: 1000, 0=unlimited)
+
+**Examples:**
+```bash
+# Default: 100 connections, 60 seconds, 1000 ops/sec per connection
+aerospike> hotget user1
+
+# High load: 500 connections, 30 seconds, unlimited rate
+aerospike> hotget user1 500 30 0
+
+# Moderate: 200 connections, 120 seconds, 5000 ops/sec per connection
+aerospike> hotget user1 200 120 5000
+```
+
+**Use cases:**
+- Test server read throughput
+- Test connection limits
+- Identify timeout thresholds under load
+- Stress test read replicas
+- Network performance testing
+
+#### Hot Key Write Workload (hotput)
+
+Generate a high-rate write workload on a single key to test write contention:
+
+```bash
+aerospike> hotput <key> [connections] [duration] [rate]
+```
+
+**Parameters:**
+- `key` - The key to write repeatedly (required)
+- `connections` - Number of concurrent connections (default: 100)
+- `duration` - Test duration in seconds (default: 60)
+- `rate` - Target ops/sec per connection (default: 1000, 0=unlimited)
+
+**Examples:**
+```bash
+# Default: 100 connections, 60 seconds, 1000 ops/sec per connection
+aerospike> hotput testkey
+
+# High contention: 500 connections, 30 seconds, unlimited rate
+aerospike> hotput testkey 500 30 0
+```
+
+**Features:**
+- Each write includes unique data (counter, worker_id, timestamp)
+- Tests write lock contention
+- Shows final generation count
+- Displays final record state after completion
+
+**Use cases:**
+- Test write contention handling
+- Test generation counter behavior
+- Identify write bottlenecks
+- Stress test replication under write load
+- Network saturation testing
+
 ### Configuration Commands
 
 #### View Current Configuration
@@ -367,7 +491,7 @@ aerospike> config show
 Displays all current settings organized by category:
 - **Connection**: Host, port, namespace, set, debug mode
 - **Timeout Policies**: Socket, total, and connect timeouts, max retries
-- **Write Policies**: Record exists action, generation policy, expiration/TTL, durable delete, commit level
+- **Write Policies**: Record exists action, generation policy, expiration/TTL, durable delete, send key, commit level
 - **Read Policies**: Read modes (AP/SC), replica policy
 
 #### Change Configuration at Runtime
@@ -389,7 +513,7 @@ aerospike> config set <parameter> <value>
   - `REPLACE` - Replace entire record
   - `REPLACE_ONLY` - Replace only if exists
   - `CREATE_ONLY` - Create only if doesn't exist
-- `generation-policy <policy>` - Generation checking
+- `generation-policy <policy>` - Generation checking for optimistic concurrency control
   - `NONE` - No generation check (default)
   - `EXPECT_GEN_EQUAL` - Expect exact generation match
   - `EXPECT_GEN_GT` - Expect generation greater than
@@ -495,19 +619,24 @@ Example:
 aerospike> put record1 count=100 price=19.99 active=true name=Product
 ```
 
-## Cluster Information
+## Aerospike Epoch Times
 
-When using the `get` command, the CLI displays cluster topology information:
+Aerospike uses the **Citrusleaf epoch** which starts at **January 1, 2010 00:00:00 UTC** (not Unix epoch of 1970).
 
-- **Partition ID**: The partition where the record resides (0-4095)
-- **Master Node**: The node currently holding the master copy with node name and address
-- **Replica Nodes**: Other nodes in the cluster holding replica copies
+### Expiration Values:
+- **0**: Record never expires
+- **4294967295**: Record never expires (max uint32)
+- **Positive number**: Seconds since January 1, 2010 when record expires
 
-This information is useful for:
-- Understanding data distribution across the cluster
-- Debugging replication issues
-- Capacity planning and load balancing
-- Verifying rack-aware or data-center-aware configurations
+### Last Update Time (LUT):
+- Stored in **milliseconds** since Citrusleaf epoch
+- Automatically converted to readable format in output
+
+Example conversions shown in CLI:
+```
+Expiration: 439467349 (2023-12-15 10:22:29 UTC, TTL: 5d 3h 45m 20s)
+Last Update Time: 439467349490 (2023-12-15 10:22:29 UTC)
+```
 
 ## Debug Mode
 
@@ -544,13 +673,16 @@ aerospike> put user3 name=Charlie age=25 city=SF salary=55000
 # Query by age
 aerospike> query age 25
 
+# Show all indexes
+aerospike> show-indexes
+
 # Register a UDF (assuming you have increment.lua)
 aerospike> register-udf /path/to/increment.lua
 
 # List registered UDFs
 aerospike> list-udfs
 
-# Execute UDF on a single record (gets immediate result)
+# Execute UDF on a single record
 aerospike> execute-udf increment.add_value(salary,5000) ON test.users WHERE PK = user1
 
 # Execute UDF on query results (background operation)
@@ -568,11 +700,26 @@ aerospike> batch-get user1 user2 user3
 # Update a record
 aerospike> put user1 name=Alice age=26 city=NYC
 
+# Get record with full metadata
+aerospike> get user1
+
+# Debug record metadata by digest
+aerospike> debug-record-meta 0a1b2c3d4e5f6789abcdef0123456789abcdef01
+
+# Performance test - read workload
+aerospike> hotget user1 100 30 1000
+
+# Performance test - write workload
+aerospike> hotput testkey 50 20 500
+
 # Delete a record
 aerospike> delete user3
 
 # Scan all records
 aerospike> scan
+
+# Touch all records to reset TTL
+aerospike> scan-touch
 
 # Remove UDF
 aerospike> remove-udf increment.lua
@@ -686,98 +833,6 @@ function count_above_threshold(stream, bin_name, threshold)
 end
 ```
 
-## Using UDFs - Step by Step
-
-### 1. Create Your UDF File
-
-Create a file named `myudf.lua`:
-
-```lua
-function add_bonus(rec, bin_name, bonus_amount)
-    if not aerospike:exists(rec) then
-        return 0
-    end
-    
-    local current = rec[bin_name] or 0
-    rec[bin_name] = current + bonus_amount
-    
-    aerospike:update(rec)
-    return rec[bin_name]
-end
-```
-
-### 2. Register the UDF
-
-```bash
-aerospike> register-udf /path/to/myudf.lua
-```
-
-### 3. Execute on Different Scopes
-
-**Single record (with result):**
-```bash
-aerospike> execute-udf myudf.add_bonus(salary,1000) ON test.users WHERE PK = user1
-```
-
-**Query results (background):**
-```bash
-aerospike> execute-udf myudf.add_bonus(salary,500) ON test.users WHERE age = 30
-```
-
-**Range query (background):**
-```bash
-aerospike> execute-udf myudf.add_bonus(salary,200) ON test.users WHERE age BETWEEN 25 AND 35
-```
-
-**All records (background):**
-```bash
-aerospike> execute-udf myudf.add_bonus(bonus,100) ON test.users
-```
-
-### 4. Verify Changes
-
-```bash
-aerospike> get user1
-```
-
-## Example Workflow
-
-Here's a complete example workflow:
-
-```bash
-# Start the client
-./aerospike-cli -h localhost -p 3000 -n test -d
-
-# Create a secondary index on age
-aerospike> create-index idx_age age numeric
-
-# Insert some records
-aerospike> put user1 name=Alice age=25 city=NYC
-aerospike> put user2 name=Bob age=30 city=LA
-aerospike> put user3 name=Charlie age=25 city=SF
-
-# Query by age
-aerospike> query age 25
-
-# Batch read
-aerospike> batch-get user1 user2 user3
-
-# Update a record
-aerospike> put user1 name=Alice age=26 city=NYC
-
-# Delete a record
-aerospike> delete user3
-
-# Scan all records
-aerospike> scan
-
-# Drop the index
-aerospike> drop-index idx_age
-
-# Exit
-aerospike> exit
-```
-
 ## Troubleshooting
 
 ### Connection Issues
@@ -796,6 +851,7 @@ If queries fail:
 1. Ensure a secondary index exists on the bin you're querying
 2. Create the index using `create-index` command
 3. Verify the index type matches the data type (numeric vs string)
+4. Use `show-indexes` to verify index state is RW (read-write ready)
 
 ### UDF Issues
 
@@ -842,6 +898,7 @@ If you encounter build errors:
 1. Ensure you have Go 1.18 or higher: `go version`
 2. Verify dependencies are installed: `go mod tidy`
 3. Check for the correct Aerospike client version: `go get github.com/aerospike/aerospike-client-go/v7`
+4. Ensure readline library is installed: `go get github.com/chzyer/readline`
 
 ## Advanced Usage
 
@@ -919,6 +976,31 @@ aerospike> query status active
 2. Create secondary indexes on frequently queried bins
 3. Adjust timeout policies based on your network latency
 4. Use the scan command sparingly on large datasets
+5. Use `hotget` and `hotput` to identify performance bottlenecks
+6. Enable `send-key` policy only when necessary (increases storage)
+7. Use `durable-delete` for critical deletions that must be persisted
+
+## Policy Best Practices
+
+### Write Policies
+
+- **Use CREATE_ONLY** for insert-only operations to prevent accidental updates
+- **Enable durable-delete** for compliance or audit requirements
+- **Use generation-policy** for optimistic concurrency control (prevent lost updates)
+- **Set appropriate TTL** to manage data lifecycle automatically
+- **Enable send-key** when you need to retrieve keys during scans
+
+### Read Policies
+
+- **Use MASTER replica** for strong consistency requirements
+- **Use MASTER_PROLES** for load distribution with eventual consistency
+- **Use SESSION read-mode-sc** for session consistency in SC namespaces
+- **Use LINEARIZE** when you need strongest consistency guarantees
+
+### Commit Levels
+
+- **COMMIT_ALL** (default) - Wait for all replicas, ensures durability
+- **COMMIT_MASTER** - Faster writes, lower durability guarantee
 
 ## License
 
