@@ -162,7 +162,7 @@ This command returns:
 - Last update time (with human-readable conversion)
 - Number of bins
 - Set name
-- **XDR write flag** - Whether record needs XDR replication
+- **XDR write flag** - Whether record is XDR replication
 - **XDR tombstone** - XDR tombstone status
 - **XDR NSUP tombstone** - NSUP tombstone status
 - **Tombstone flag** - Whether record is marked for deletion
