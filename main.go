@@ -5,6 +5,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	aero "github.com/aerospike/aerospike-client-go/v7"
@@ -239,6 +240,10 @@ func (c *CLI) handleCommand(line string) {
 		c.handleScan(parts[1:])
 	case "scan-touch":
 		c.handleScanTouch(parts[1:])
+	case "hotget":
+		c.handleHotGet(parts[1:])
+	case "hotput":
+		c.handleHotPut(parts[1:])
 	case "create-index":
 		c.handleCreateIndex(parts[1:])
 	case "drop-index":
@@ -286,6 +291,16 @@ func (c *CLI) printHelp() {
 	fmt.Println("      Scan all records in current namespace/set")
 	fmt.Println("  scan-touch")
 	fmt.Println("      Scan and touch all records (reset TTL to namespace default)")
+	fmt.Println("  hotget <key> [connections] [duration] [rate]")
+	fmt.Println("      Generate high-rate read workload on a single key")
+	fmt.Println("      connections: number of concurrent connections (default: 100)")
+	fmt.Println("      duration: test duration in seconds (default: 60)")
+	fmt.Println("      rate: target ops/sec per connection (default: 1000, 0=unlimited)")
+	fmt.Println("  hotput <key> [connections] [duration] [rate]")
+	fmt.Println("      Generate high-rate write workload on a single key")
+	fmt.Println("      connections: number of concurrent connections (default: 100)")
+	fmt.Println("      duration: test duration in seconds (default: 60)")
+	fmt.Println("      rate: target ops/sec per connection (default: 1000, 0=unlimited)")
 	
 	fmt.Println("\nSecondary Index Operations:")
 	fmt.Println("  create-index <name> <bin> <type>")
@@ -805,6 +820,406 @@ func (c *CLI) handleScanTouch(args []string) {
 	fmt.Printf("  Records touched: %d\n", count)
 	if errors > 0 {
 		fmt.Printf("  Errors: %d\n", errors)
+	}
+}
+
+func (c *CLI) handleHotGet(args []string) {
+	if len(args) < 1 {
+		fmt.Println("Usage: hotget <key> [connections] [duration] [rate]")
+		fmt.Println("\nGenerate a high-rate read workload on a single key")
+		fmt.Println("\nParameters:")
+		fmt.Println("  key          - Key to read repeatedly")
+		fmt.Println("  connections  - Number of concurrent connections (default: 100)")
+		fmt.Println("  duration     - Test duration in seconds (default: 60)")
+		fmt.Println("  rate         - Target ops/sec per connection (default: 1000, 0=unlimited)")
+		fmt.Println("\nExample:")
+		fmt.Println("  hotget user1 200 30 5000")
+		fmt.Println("  (200 connections, 30 seconds, 5000 ops/sec per connection)")
+		return
+	}
+
+	keyValue := args[0]
+	
+	// Parse optional parameters
+	connections := 100
+	duration := 60
+	targetRate := 1000
+	
+	if len(args) > 1 {
+		if c, err := strconv.Atoi(args[1]); err == nil {
+			connections = c
+		}
+	}
+	if len(args) > 2 {
+		if d, err := strconv.Atoi(args[2]); err == nil {
+			duration = d
+		}
+	}
+	if len(args) > 3 {
+		if r, err := strconv.Atoi(args[3]); err == nil {
+			targetRate = r
+		}
+	}
+
+	// Create the key
+	key, err := aero.NewKey(c.config.Namespace, c.config.Set, keyValue)
+	if err != nil {
+		c.logError("Error creating key", err)
+		return
+	}
+
+	// Verify key exists first
+	policy := c.getReadPolicy()
+	record, err := c.client.Get(policy, key)
+	if err != nil {
+		c.logError("Failed to read key (does it exist?)", err)
+		return
+	}
+	if record == nil {
+		fmt.Printf("Key '%s' not found. Please create it first.\n", keyValue)
+		return
+	}
+
+	fmt.Println("\n========================================")
+	fmt.Println("         Hot Key Read Workload")
+	fmt.Println("========================================")
+	fmt.Printf("Key:         %s\n", keyValue)
+	fmt.Printf("Namespace:   %s\n", c.config.Namespace)
+	if c.config.Set != "" {
+		fmt.Printf("Set:         %s\n", c.config.Set)
+	}
+	fmt.Printf("Connections: %d\n", connections)
+	fmt.Printf("Duration:    %d seconds\n", duration)
+	if targetRate > 0 {
+		fmt.Printf("Target Rate: %d ops/sec per connection\n", targetRate)
+		fmt.Printf("Total Rate:  ~%d ops/sec\n", targetRate*connections)
+	} else {
+		fmt.Printf("Target Rate: Unlimited (max throughput)\n")
+	}
+	fmt.Println("========================================")
+	fmt.Print("\nStarting workload in 3 seconds... Press Ctrl+C to stop early\n")
+	time.Sleep(3 * time.Second)
+
+	// Statistics tracking
+	type Stats struct {
+		success int64
+		errors  int64
+		timeout int64
+	}
+	
+	var stats Stats
+	var mu sync.Mutex
+	stopChan := make(chan bool)
+	var wg sync.WaitGroup
+
+	// Start worker goroutines
+	for i := 0; i < connections; i++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+			
+			localSuccess := int64(0)
+			localErrors := int64(0)
+			localTimeout := int64(0)
+			
+			// Rate limiting setup
+			var ticker *time.Ticker
+			var tickChan <-chan time.Time
+			if targetRate > 0 {
+				interval := time.Second / time.Duration(targetRate)
+				ticker = time.NewTicker(interval)
+				tickChan = ticker.C
+				defer ticker.Stop()
+			}
+
+			for {
+				select {
+				case <-stopChan:
+					mu.Lock()
+					stats.success += localSuccess
+					stats.errors += localErrors
+					stats.timeout += localTimeout
+					mu.Unlock()
+					return
+				default:
+					// Rate limit if configured
+					if targetRate > 0 {
+						<-tickChan
+					}
+					
+					// Perform read
+					_, err := c.client.Get(policy, key)
+					if err != nil {
+						if aerr, ok := err.(*aero.AerospikeError); ok {
+							if strings.Contains(strings.ToLower(aerr.Error()), "timeout") {
+								localTimeout++
+							} else {
+								localErrors++
+							}
+						} else {
+							localErrors++
+						}
+					} else {
+						localSuccess++
+					}
+				}
+			}
+		}(i)
+	}
+
+	// Progress reporting
+	startTime := time.Now()
+	endTime := startTime.Add(time.Duration(duration) * time.Second)
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+
+	fmt.Println("\nRunning... (updates every 5 seconds)")
+	fmt.Println("----------------------------------------")
+
+	for time.Now().Before(endTime) {
+		select {
+		case <-ticker.C:
+			elapsed := time.Since(startTime).Seconds()
+			mu.Lock()
+			currentSuccess := stats.success
+			currentErrors := stats.errors
+			currentTimeout := stats.timeout
+			mu.Unlock()
+			
+			total := currentSuccess + currentErrors + currentTimeout
+			opsPerSec := float64(total) / elapsed
+			
+			fmt.Printf("[%.0fs] Total: %d | Success: %d | Errors: %d | Timeouts: %d | Rate: %.0f ops/sec\n",
+				elapsed, total, currentSuccess, currentErrors, currentTimeout, opsPerSec)
+		default:
+			time.Sleep(100 * time.Millisecond)
+		}
+	}
+
+	// Stop all workers
+	close(stopChan)
+	wg.Wait()
+
+	// Final statistics
+	totalDuration := time.Since(startTime).Seconds()
+	totalOps := stats.success + stats.errors + stats.timeout
+	avgRate := float64(totalOps) / totalDuration
+
+	fmt.Println("\n========================================")
+	fmt.Println("         Workload Complete")
+	fmt.Println("========================================")
+	fmt.Printf("Duration:        %.2f seconds\n", totalDuration)
+	fmt.Printf("Total Ops:       %d\n", totalOps)
+	fmt.Printf("Successful:      %d (%.2f%%)\n", stats.success, float64(stats.success)/float64(totalOps)*100)
+	fmt.Printf("Errors:          %d (%.2f%%)\n", stats.errors, float64(stats.errors)/float64(totalOps)*100)
+	fmt.Printf("Timeouts:        %d (%.2f%%)\n", stats.timeout, float64(stats.timeout)/float64(totalOps)*100)
+	fmt.Printf("Average Rate:    %.0f ops/sec\n", avgRate)
+	fmt.Printf("Per Connection:  %.0f ops/sec\n", avgRate/float64(connections))
+	fmt.Println("========================================")
+}
+
+func (c *CLI) handleHotPut(args []string) {
+	if len(args) < 1 {
+		fmt.Println("Usage: hotput <key> [connections] [duration] [rate]")
+		fmt.Println("\nGenerate a high-rate write workload on a single key")
+		fmt.Println("\nParameters:")
+		fmt.Println("  key          - Key to write repeatedly")
+		fmt.Println("  connections  - Number of concurrent connections (default: 100)")
+		fmt.Println("  duration     - Test duration in seconds (default: 60)")
+		fmt.Println("  rate         - Target ops/sec per connection (default: 1000, 0=unlimited)")
+		fmt.Println("\nExample:")
+		fmt.Println("  hotput user1 200 30 5000")
+		fmt.Println("  (200 connections, 30 seconds, 5000 ops/sec per connection)")
+		fmt.Println("\nNote: Each write increments a counter bin to create unique writes")
+		return
+	}
+
+	keyValue := args[0]
+	
+	// Parse optional parameters
+	connections := 100
+	duration := 60
+	targetRate := 1000
+	
+	if len(args) > 1 {
+		if c, err := strconv.Atoi(args[1]); err == nil {
+			connections = c
+		}
+	}
+	if len(args) > 2 {
+		if d, err := strconv.Atoi(args[2]); err == nil {
+			duration = d
+		}
+	}
+	if len(args) > 3 {
+		if r, err := strconv.Atoi(args[3]); err == nil {
+			targetRate = r
+		}
+	}
+
+	// Create the key
+	key, err := aero.NewKey(c.config.Namespace, c.config.Set, keyValue)
+	if err != nil {
+		c.logError("Error creating key", err)
+		return
+	}
+
+	fmt.Println("\n========================================")
+	fmt.Println("         Hot Key Write Workload")
+	fmt.Println("========================================")
+	fmt.Printf("Key:         %s\n", keyValue)
+	fmt.Printf("Namespace:   %s\n", c.config.Namespace)
+	if c.config.Set != "" {
+		fmt.Printf("Set:         %s\n", c.config.Set)
+	}
+	fmt.Printf("Connections: %d\n", connections)
+	fmt.Printf("Duration:    %d seconds\n", duration)
+	if targetRate > 0 {
+		fmt.Printf("Target Rate: %d ops/sec per connection\n", targetRate)
+		fmt.Printf("Total Rate:  ~%d ops/sec\n", targetRate*connections)
+	} else {
+		fmt.Printf("Target Rate: Unlimited (max throughput)\n")
+	}
+	fmt.Println("========================================")
+	fmt.Print("\nStarting workload in 3 seconds... Press Ctrl+C to stop early\n")
+	time.Sleep(3 * time.Second)
+
+	// Statistics tracking
+	type Stats struct {
+		success int64
+		errors  int64
+		timeout int64
+	}
+	
+	var stats Stats
+	var mu sync.Mutex
+	stopChan := make(chan bool)
+	var wg sync.WaitGroup
+
+	// Start worker goroutines
+	for i := 0; i < connections; i++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+			
+			localSuccess := int64(0)
+			localErrors := int64(0)
+			localTimeout := int64(0)
+			counter := int64(0)
+			
+			// Rate limiting setup
+			var ticker *time.Ticker
+			var tickChan <-chan time.Time
+			if targetRate > 0 {
+				interval := time.Second / time.Duration(targetRate)
+				ticker = time.NewTicker(interval)
+				tickChan = ticker.C
+				defer ticker.Stop()
+			}
+
+			writePolicy := c.getWritePolicy()
+
+			for {
+				select {
+				case <-stopChan:
+					mu.Lock()
+					stats.success += localSuccess
+					stats.errors += localErrors
+					stats.timeout += localTimeout
+					mu.Unlock()
+					return
+				default:
+					// Rate limit if configured
+					if targetRate > 0 {
+						<-tickChan
+					}
+					
+					// Perform write with incrementing counter
+					counter++
+					bins := aero.BinMap{
+						"counter":   counter,
+						"worker_id": workerID,
+						"timestamp": time.Now().Unix(),
+					}
+					
+					err := c.client.Put(writePolicy, key, bins)
+					if err != nil {
+						if aerr, ok := err.(*aero.AerospikeError); ok {
+							if strings.Contains(strings.ToLower(aerr.Error()), "timeout") {
+								localTimeout++
+							} else {
+								localErrors++
+							}
+						} else {
+							localErrors++
+						}
+					} else {
+						localSuccess++
+					}
+				}
+			}
+		}(i)
+	}
+
+	// Progress reporting
+	startTime := time.Now()
+	endTime := startTime.Add(time.Duration(duration) * time.Second)
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+
+	fmt.Println("\nRunning... (updates every 5 seconds)")
+	fmt.Println("----------------------------------------")
+
+	for time.Now().Before(endTime) {
+		select {
+		case <-ticker.C:
+			elapsed := time.Since(startTime).Seconds()
+			mu.Lock()
+			currentSuccess := stats.success
+			currentErrors := stats.errors
+			currentTimeout := stats.timeout
+			mu.Unlock()
+			
+			total := currentSuccess + currentErrors + currentTimeout
+			opsPerSec := float64(total) / elapsed
+			
+			fmt.Printf("[%.0fs] Total: %d | Success: %d | Errors: %d | Timeouts: %d | Rate: %.0f ops/sec\n",
+				elapsed, total, currentSuccess, currentErrors, currentTimeout, opsPerSec)
+		default:
+			time.Sleep(100 * time.Millisecond)
+		}
+	}
+
+	// Stop all workers
+	close(stopChan)
+	wg.Wait()
+
+	// Final statistics
+	totalDuration := time.Since(startTime).Seconds()
+	totalOps := stats.success + stats.errors + stats.timeout
+	avgRate := float64(totalOps) / totalDuration
+
+	fmt.Println("\n========================================")
+	fmt.Println("         Workload Complete")
+	fmt.Println("========================================")
+	fmt.Printf("Duration:        %.2f seconds\n", totalDuration)
+	fmt.Printf("Total Ops:       %d\n", totalOps)
+	fmt.Printf("Successful:      %d (%.2f%%)\n", stats.success, float64(stats.success)/float64(totalOps)*100)
+	fmt.Printf("Errors:          %d (%.2f%%)\n", stats.errors, float64(stats.errors)/float64(totalOps)*100)
+	fmt.Printf("Timeouts:        %d (%.2f%%)\n", stats.timeout, float64(stats.timeout)/float64(totalOps)*100)
+	fmt.Printf("Average Rate:    %.0f ops/sec\n", avgRate)
+	fmt.Printf("Per Connection:  %.0f ops/sec\n", avgRate/float64(connections))
+	fmt.Println("========================================")
+	
+	// Show final record state
+	fmt.Println("\nFinal record state:")
+	readPolicy := c.getReadPolicy()
+	record, err := c.client.Get(readPolicy, key)
+	if err == nil && record != nil {
+		fmt.Printf("  Generation: %d\n", record.Generation)
+		for binName, binValue := range record.Bins {
+			fmt.Printf("  %s: %v\n", binName, binValue)
+		}
 	}
 }
 
