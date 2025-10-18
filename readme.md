@@ -1,4 +1,4 @@
-# Aerospike Interactive CLI Client
+# Aerospike Interactive CLI Client - Experimental
 
 A powerful command-line interface for interacting with Aerospike databases. This tool provides an interactive prompt with command history, full CRUD operations, secondary index management, UDF support, comprehensive load testing capabilities, and advanced performance testing features.
 
