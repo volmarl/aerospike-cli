@@ -2,10 +2,12 @@ package main
 
 import (
 	"fmt"
+	"math/rand"
 	"os"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	aero "github.com/aerospike/aerospike-client-go/v7"
@@ -43,6 +45,52 @@ type Config struct {
 type CLI struct {
 	client *aero.Client
 	config *Config
+}
+
+// LoadTest statistics
+type LoadTestStats struct {
+	totalOps    int64
+	successOps  int64
+	errorOps    int64
+	timeoutOps  int64
+	startTime   time.Time
+	latencies   []int64 // microseconds
+	latencyLock sync.Mutex
+}
+
+func (s *LoadTestStats) recordLatency(latency int64) {
+	s.latencyLock.Lock()
+	defer s.latencyLock.Unlock()
+	s.latencies = append(s.latencies, latency)
+}
+
+func (s *LoadTestStats) getPercentiles() (p50, p95, p99, pMax int64) {
+	s.latencyLock.Lock()
+	defer s.latencyLock.Unlock()
+	
+	if len(s.latencies) == 0 {
+		return 0, 0, 0, 0
+	}
+	
+	// Simple percentile calculation
+	sorted := make([]int64, len(s.latencies))
+	copy(sorted, s.latencies)
+	
+	// Bubble sort (fine for small samples, use quicksort for production)
+	for i := 0; i < len(sorted); i++ {
+		for j := i + 1; j < len(sorted); j++ {
+			if sorted[i] > sorted[j] {
+				sorted[i], sorted[j] = sorted[j], sorted[i]
+			}
+		}
+	}
+	
+	p50 = sorted[len(sorted)*50/100]
+	p95 = sorted[len(sorted)*95/100]
+	p99 = sorted[len(sorted)*99/100]
+	pMax = sorted[len(sorted)-1]
+	
+	return
 }
 
 func main() {
@@ -244,6 +292,14 @@ func (c *CLI) handleCommand(line string) {
 		c.handleHotGet(parts[1:])
 	case "hotput":
 		c.handleHotPut(parts[1:])
+	case "loadtest-read":
+		c.handleLoadTestRead(parts[1:])
+	case "loadtest-write":
+		c.handleLoadTestWrite(parts[1:])
+	case "loadtest-batch-read":
+		c.handleLoadTestBatchRead(parts[1:])
+	case "loadtest-batch-write":
+		c.handleLoadTestBatchWrite(parts[1:])
 	case "create-index":
 		c.handleCreateIndex(parts[1:])
 	case "drop-index":
@@ -291,6 +347,24 @@ func (c *CLI) printHelp() {
 	fmt.Println("      Scan all records in current namespace/set")
 	fmt.Println("  scan-touch")
 	fmt.Println("      Scan and touch all records (reset TTL to namespace default)")
+	
+	fmt.Println("\nLoad Testing (Distributed Workloads):")
+	fmt.Println("  loadtest-read [keyPrefix] [numKeys] [threads] [duration] [rate]")
+	fmt.Println("      Distributed read workload across multiple keys")
+	fmt.Println("      keyPrefix: prefix for keys (default: loadtest)")
+	fmt.Println("      numKeys: number of unique keys (default: 1000)")
+	fmt.Println("      threads: concurrent workers (default: 50)")
+	fmt.Println("      duration: test duration in seconds (default: 60)")
+	fmt.Println("      rate: target ops/sec per thread (default: 100, 0=unlimited)")
+	fmt.Println("  loadtest-write [keyPrefix] [numKeys] [threads] [duration] [rate]")
+	fmt.Println("      Distributed write workload across multiple keys")
+	fmt.Println("  loadtest-batch-read [keyPrefix] [numKeys] [batchSize] [threads] [duration] [rate]")
+	fmt.Println("      Batch read workload")
+	fmt.Println("      batchSize: keys per batch request (default: 10)")
+	fmt.Println("  loadtest-batch-write [keyPrefix] [numKeys] [batchSize] [threads] [duration] [rate]")
+	fmt.Println("      Batch write workload")
+	
+	fmt.Println("\nHot Key Testing (Single Key Contention):")
 	fmt.Println("  hotget <key> [connections] [duration] [rate]")
 	fmt.Println("      Generate high-rate read workload on a single key")
 	fmt.Println("      connections: number of concurrent connections (default: 100)")
@@ -298,9 +372,6 @@ func (c *CLI) printHelp() {
 	fmt.Println("      rate: target ops/sec per connection (default: 1000, 0=unlimited)")
 	fmt.Println("  hotput <key> [connections] [duration] [rate]")
 	fmt.Println("      Generate high-rate write workload on a single key")
-	fmt.Println("      connections: number of concurrent connections (default: 100)")
-	fmt.Println("      duration: test duration in seconds (default: 60)")
-	fmt.Println("      rate: target ops/sec per connection (default: 1000, 0=unlimited)")
 	
 	fmt.Println("\nSecondary Index Operations:")
 	fmt.Println("  create-index <name> <bin> <type>")
@@ -1223,6 +1294,644 @@ func (c *CLI) handleHotPut(args []string) {
 	}
 }
 
+// Load Test Handlers
+
+func (c *CLI) handleLoadTestRead(args []string) {
+	// Parse parameters
+	keyPrefix := "loadtest"
+	numKeys := 1000
+	threads := 50
+	duration := 60
+	targetRate := 100
+
+	if len(args) > 0 {
+		keyPrefix = args[0]
+	}
+	if len(args) > 1 {
+		if n, err := strconv.Atoi(args[1]); err == nil {
+			numKeys = n
+		}
+	}
+	if len(args) > 2 {
+		if t, err := strconv.Atoi(args[2]); err == nil {
+			threads = t
+		}
+	}
+	if len(args) > 3 {
+		if d, err := strconv.Atoi(args[3]); err == nil {
+			duration = d
+		}
+	}
+	if len(args) > 4 {
+		if r, err := strconv.Atoi(args[4]); err == nil {
+			targetRate = r
+		}
+	}
+
+	fmt.Println("\n========================================")
+	fmt.Println("      Load Test - Distributed Reads")
+	fmt.Println("========================================")
+	fmt.Printf("Key Prefix:  %s\n", keyPrefix)
+	fmt.Printf("Num Keys:    %d\n", numKeys)
+	fmt.Printf("Threads:     %d\n", threads)
+	fmt.Printf("Duration:    %d seconds\n", duration)
+	if targetRate > 0 {
+		fmt.Printf("Target Rate: %d ops/sec per thread\n", targetRate)
+		fmt.Printf("Total Rate:  ~%d ops/sec\n", targetRate*threads)
+	} else {
+		fmt.Printf("Target Rate: Unlimited\n")
+	}
+	fmt.Println("========================================")
+
+	// First, ensure keys exist
+	fmt.Print("\nPreparing test data... ")
+	writePolicy := c.getWritePolicy()
+	for i := 0; i < numKeys; i++ {
+		key, _ := aero.NewKey(c.config.Namespace, c.config.Set, fmt.Sprintf("%s_%d", keyPrefix, i))
+		bins := aero.BinMap{
+			"id":        i,
+			"data":      fmt.Sprintf("testdata_%d", i),
+			"timestamp": time.Now().Unix(),
+		}
+		c.client.Put(writePolicy, key, bins)
+		if (i+1)%100 == 0 {
+			fmt.Printf(".")
+		}
+	}
+	fmt.Println(" Done!")
+
+	fmt.Print("\nStarting load test in 3 seconds...\n")
+	time.Sleep(3 * time.Second)
+
+	// Run load test
+	stats := &LoadTestStats{
+		startTime: time.Now(),
+		latencies: make([]int64, 0, 10000),
+	}
+	
+	stopChan := make(chan bool)
+	var wg sync.WaitGroup
+
+	// Start worker threads
+	for i := 0; i < threads; i++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+			c.loadTestReadWorker(workerID, keyPrefix, numKeys, targetRate, stopChan, stats)
+		}(i)
+	}
+
+	// Progress reporting
+	c.reportProgress(duration, stopChan, stats, "READ")
+
+	// Stop workers
+	close(stopChan)
+	wg.Wait()
+
+	// Final report
+	c.printLoadTestReport(stats, "READ")
+}
+
+func (c *CLI) handleLoadTestWrite(args []string) {
+	// Parse parameters
+	keyPrefix := "loadtest"
+	numKeys := 1000
+	threads := 50
+	duration := 60
+	targetRate := 100
+
+	if len(args) > 0 {
+		keyPrefix = args[0]
+	}
+	if len(args) > 1 {
+		if n, err := strconv.Atoi(args[1]); err == nil {
+			numKeys = n
+		}
+	}
+	if len(args) > 2 {
+		if t, err := strconv.Atoi(args[2]); err == nil {
+			threads = t
+		}
+	}
+	if len(args) > 3 {
+		if d, err := strconv.Atoi(args[3]); err == nil {
+			duration = d
+		}
+	}
+	if len(args) > 4 {
+		if r, err := strconv.Atoi(args[4]); err == nil {
+			targetRate = r
+		}
+	}
+
+	fmt.Println("\n========================================")
+	fmt.Println("      Load Test - Distributed Writes")
+	fmt.Println("========================================")
+	fmt.Printf("Key Prefix:  %s\n", keyPrefix)
+	fmt.Printf("Num Keys:    %d\n", numKeys)
+	fmt.Printf("Threads:     %d\n", threads)
+	fmt.Printf("Duration:    %d seconds\n", duration)
+	if targetRate > 0 {
+		fmt.Printf("Target Rate: %d ops/sec per thread\n", targetRate)
+		fmt.Printf("Total Rate:  ~%d ops/sec\n", targetRate*threads)
+	} else {
+		fmt.Printf("Target Rate: Unlimited\n")
+	}
+	fmt.Println("========================================")
+
+	fmt.Print("\nStarting load test in 3 seconds...\n")
+	time.Sleep(3 * time.Second)
+
+	// Run load test
+	stats := &LoadTestStats{
+		startTime: time.Now(),
+		latencies: make([]int64, 0, 10000),
+	}
+	
+	stopChan := make(chan bool)
+	var wg sync.WaitGroup
+
+	// Start worker threads
+	for i := 0; i < threads; i++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+			c.loadTestWriteWorker(workerID, keyPrefix, numKeys, targetRate, stopChan, stats)
+		}(i)
+	}
+
+	// Progress reporting
+	c.reportProgress(duration, stopChan, stats, "WRITE")
+
+	// Stop workers
+	close(stopChan)
+	wg.Wait()
+
+	// Final report
+	c.printLoadTestReport(stats, "WRITE")
+}
+
+func (c *CLI) handleLoadTestBatchRead(args []string) {
+	// Parse parameters
+	keyPrefix := "loadtest"
+	numKeys := 1000
+	batchSize := 10
+	threads := 50
+	duration := 60
+	targetRate := 10 // Lower default for batch ops
+
+	if len(args) > 0 {
+		keyPrefix = args[0]
+	}
+	if len(args) > 1 {
+		if n, err := strconv.Atoi(args[1]); err == nil {
+			numKeys = n
+		}
+	}
+	if len(args) > 2 {
+		if b, err := strconv.Atoi(args[2]); err == nil {
+			batchSize = b
+		}
+	}
+	if len(args) > 3 {
+		if t, err := strconv.Atoi(args[3]); err == nil {
+			threads = t
+		}
+	}
+	if len(args) > 4 {
+		if d, err := strconv.Atoi(args[4]); err == nil {
+			duration = d
+		}
+	}
+	if len(args) > 5 {
+		if r, err := strconv.Atoi(args[5]); err == nil {
+			targetRate = r
+		}
+	}
+
+	fmt.Println("\n========================================")
+	fmt.Println("     Load Test - Batch Reads")
+	fmt.Println("========================================")
+	fmt.Printf("Key Prefix:  %s\n", keyPrefix)
+	fmt.Printf("Num Keys:    %d\n", numKeys)
+	fmt.Printf("Batch Size:  %d\n", batchSize)
+	fmt.Printf("Threads:     %d\n", threads)
+	fmt.Printf("Duration:    %d seconds\n", duration)
+	if targetRate > 0 {
+		fmt.Printf("Target Rate: %d batch ops/sec per thread\n", targetRate)
+		fmt.Printf("Total Rate:  ~%d batch ops/sec (~%d individual reads/sec)\n", 
+			targetRate*threads, targetRate*threads*batchSize)
+	} else {
+		fmt.Printf("Target Rate: Unlimited\n")
+	}
+	fmt.Println("========================================")
+
+	// Prepare test data
+	fmt.Print("\nPreparing test data... ")
+	writePolicy := c.getWritePolicy()
+	for i := 0; i < numKeys; i++ {
+		key, _ := aero.NewKey(c.config.Namespace, c.config.Set, fmt.Sprintf("%s_%d", keyPrefix, i))
+		bins := aero.BinMap{
+			"id":        i,
+			"data":      fmt.Sprintf("testdata_%d", i),
+			"timestamp": time.Now().Unix(),
+		}
+		c.client.Put(writePolicy, key, bins)
+		if (i+1)%100 == 0 {
+			fmt.Printf(".")
+		}
+	}
+	fmt.Println(" Done!")
+
+	fmt.Print("\nStarting load test in 3 seconds...\n")
+	time.Sleep(3 * time.Second)
+
+	// Run load test
+	stats := &LoadTestStats{
+		startTime: time.Now(),
+		latencies: make([]int64, 0, 10000),
+	}
+	
+	stopChan := make(chan bool)
+	var wg sync.WaitGroup
+
+	// Start worker threads
+	for i := 0; i < threads; i++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+			c.loadTestBatchReadWorker(workerID, keyPrefix, numKeys, batchSize, targetRate, stopChan, stats)
+		}(i)
+	}
+
+	// Progress reporting
+	c.reportProgress(duration, stopChan, stats, "BATCH-READ")
+
+	// Stop workers
+	close(stopChan)
+	wg.Wait()
+
+	// Final report
+	c.printLoadTestReport(stats, "BATCH-READ")
+}
+
+func (c *CLI) handleLoadTestBatchWrite(args []string) {
+	// Parse parameters
+	keyPrefix := "loadtest"
+	numKeys := 1000
+	batchSize := 10
+	threads := 50
+	duration := 60
+	targetRate := 10
+
+	if len(args) > 0 {
+		keyPrefix = args[0]
+	}
+	if len(args) > 1 {
+		if n, err := strconv.Atoi(args[1]); err == nil {
+			numKeys = n
+		}
+	}
+	if len(args) > 2 {
+		if b, err := strconv.Atoi(args[2]); err == nil {
+			batchSize = b
+		}
+	}
+	if len(args) > 3 {
+		if t, err := strconv.Atoi(args[3]); err == nil {
+			threads = t
+		}
+	}
+	if len(args) > 4 {
+		if d, err := strconv.Atoi(args[4]); err == nil {
+			duration = d
+		}
+	}
+	if len(args) > 5 {
+		if r, err := strconv.Atoi(args[5]); err == nil {
+			targetRate = r
+		}
+	}
+
+	fmt.Println("\n========================================")
+	fmt.Println("     Load Test - Batch Writes")
+	fmt.Println("========================================")
+	fmt.Printf("Key Prefix:  %s\n", keyPrefix)
+	fmt.Printf("Num Keys:    %d\n", numKeys)
+	fmt.Printf("Batch Size:  %d\n", batchSize)
+	fmt.Printf("Threads:     %d\n", threads)
+	fmt.Printf("Duration:    %d seconds\n", duration)
+	if targetRate > 0 {
+		fmt.Printf("Target Rate: %d batch ops/sec per thread\n", targetRate)
+		fmt.Printf("Total Rate:  ~%d batch ops/sec (~%d individual writes/sec)\n", 
+			targetRate*threads, targetRate*threads*batchSize)
+	} else {
+		fmt.Printf("Target Rate: Unlimited\n")
+	}
+	fmt.Println("========================================")
+
+	fmt.Print("\nStarting load test in 3 seconds...\n")
+	time.Sleep(3 * time.Second)
+
+	// Run load test
+	stats := &LoadTestStats{
+		startTime: time.Now(),
+		latencies: make([]int64, 0, 10000),
+	}
+	
+	stopChan := make(chan bool)
+	var wg sync.WaitGroup
+
+	// Start worker threads
+	for i := 0; i < threads; i++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+			c.loadTestBatchWriteWorker(workerID, keyPrefix, numKeys, batchSize, targetRate, stopChan, stats)
+		}(i)
+	}
+
+	// Progress reporting
+	c.reportProgress(duration, stopChan, stats, "BATCH-WRITE")
+
+	// Stop workers
+	close(stopChan)
+	wg.Wait()
+
+	// Final report
+	c.printLoadTestReport(stats, "BATCH-WRITE")
+}
+
+// Load Test Worker Functions
+
+func (c *CLI) loadTestReadWorker(workerID int, keyPrefix string, numKeys int, targetRate int, stopChan chan bool, stats *LoadTestStats) {
+	policy := c.getReadPolicy()
+	rnd := rand.New(rand.NewSource(time.Now().UnixNano() + int64(workerID)))
+	
+	var ticker *time.Ticker
+	var tickChan <-chan time.Time
+	if targetRate > 0 {
+		interval := time.Second / time.Duration(targetRate)
+		ticker = time.NewTicker(interval)
+		tickChan = ticker.C
+		defer ticker.Stop()
+	}
+
+	for {
+		select {
+		case <-stopChan:
+			return
+		default:
+			if targetRate > 0 {
+				<-tickChan
+			}
+
+			keyNum := rnd.Intn(numKeys)
+			key, _ := aero.NewKey(c.config.Namespace, c.config.Set, fmt.Sprintf("%s_%d", keyPrefix, keyNum))
+			
+			start := time.Now()
+			_, err := c.client.Get(policy, key)
+			latency := time.Since(start).Microseconds()
+
+			atomic.AddInt64(&stats.totalOps, 1)
+			if err != nil {
+				if strings.Contains(strings.ToLower(err.Error()), "timeout") {
+					atomic.AddInt64(&stats.timeoutOps, 1)
+				} else {
+					atomic.AddInt64(&stats.errorOps, 1)
+				}
+			} else {
+				atomic.AddInt64(&stats.successOps, 1)
+				stats.recordLatency(latency)
+			}
+		}
+	}
+}
+
+func (c *CLI) loadTestWriteWorker(workerID int, keyPrefix string, numKeys int, targetRate int, stopChan chan bool, stats *LoadTestStats) {
+	policy := c.getWritePolicy()
+	rnd := rand.New(rand.NewSource(time.Now().UnixNano() + int64(workerID)))
+	
+	var ticker *time.Ticker
+	var tickChan <-chan time.Time
+	if targetRate > 0 {
+		interval := time.Second / time.Duration(targetRate)
+		ticker = time.NewTicker(interval)
+		tickChan = ticker.C
+		defer ticker.Stop()
+	}
+
+	counter := int64(0)
+	for {
+		select {
+		case <-stopChan:
+			return
+		default:
+			if targetRate > 0 {
+				<-tickChan
+			}
+
+			keyNum := rnd.Intn(numKeys)
+			key, _ := aero.NewKey(c.config.Namespace, c.config.Set, fmt.Sprintf("%s_%d", keyPrefix, keyNum))
+			
+			counter++
+			bins := aero.BinMap{
+				"id":        keyNum,
+				"counter":   counter,
+				"worker_id": workerID,
+				"timestamp": time.Now().Unix(),
+				"data":      fmt.Sprintf("data_%d_%d", workerID, counter),
+			}
+			
+			start := time.Now()
+			err := c.client.Put(policy, key, bins)
+			latency := time.Since(start).Microseconds()
+
+			atomic.AddInt64(&stats.totalOps, 1)
+			if err != nil {
+				if strings.Contains(strings.ToLower(err.Error()), "timeout") {
+					atomic.AddInt64(&stats.timeoutOps, 1)
+				} else {
+					atomic.AddInt64(&stats.errorOps, 1)
+				}
+			} else {
+				atomic.AddInt64(&stats.successOps, 1)
+				stats.recordLatency(latency)
+			}
+		}
+	}
+}
+
+func (c *CLI) loadTestBatchReadWorker(workerID int, keyPrefix string, numKeys int, batchSize int, targetRate int, stopChan chan bool, stats *LoadTestStats) {
+	policy := c.getBatchPolicy()
+	rnd := rand.New(rand.NewSource(time.Now().UnixNano() + int64(workerID)))
+	
+	var ticker *time.Ticker
+	var tickChan <-chan time.Time
+	if targetRate > 0 {
+		interval := time.Second / time.Duration(targetRate)
+		ticker = time.NewTicker(interval)
+		tickChan = ticker.C
+		defer ticker.Stop()
+	}
+
+	for {
+		select {
+		case <-stopChan:
+			return
+		default:
+			if targetRate > 0 {
+				<-tickChan
+			}
+
+			// Create batch of random keys
+			keys := make([]*aero.Key, batchSize)
+			for i := 0; i < batchSize; i++ {
+				keyNum := rnd.Intn(numKeys)
+				keys[i], _ = aero.NewKey(c.config.Namespace, c.config.Set, fmt.Sprintf("%s_%d", keyPrefix, keyNum))
+			}
+			
+			start := time.Now()
+			_, err := c.client.BatchGet(policy, keys)
+			latency := time.Since(start).Microseconds()
+
+			atomic.AddInt64(&stats.totalOps, 1)
+			if err != nil {
+				if strings.Contains(strings.ToLower(err.Error()), "timeout") {
+					atomic.AddInt64(&stats.timeoutOps, 1)
+				} else {
+					atomic.AddInt64(&stats.errorOps, 1)
+				}
+			} else {
+				atomic.AddInt64(&stats.successOps, 1)
+				stats.recordLatency(latency)
+			}
+		}
+	}
+}
+
+func (c *CLI) loadTestBatchWriteWorker(workerID int, keyPrefix string, numKeys int, batchSize int, targetRate int, stopChan chan bool, stats *LoadTestStats) {
+	policy := c.getWritePolicy()
+	rnd := rand.New(rand.NewSource(time.Now().UnixNano() + int64(workerID)))
+	
+	var ticker *time.Ticker
+	var tickChan <-chan time.Time
+	if targetRate > 0 {
+		interval := time.Second / time.Duration(targetRate)
+		ticker = time.NewTicker(interval)
+		tickChan = ticker.C
+		defer ticker.Stop()
+	}
+
+	counter := int64(0)
+	for {
+		select {
+		case <-stopChan:
+			return
+		default:
+			if targetRate > 0 {
+				<-tickChan
+			}
+
+			start := time.Now()
+			errors := 0
+			
+			// Write batch of records
+			for i := 0; i < batchSize; i++ {
+				keyNum := rnd.Intn(numKeys)
+				key, _ := aero.NewKey(c.config.Namespace, c.config.Set, fmt.Sprintf("%s_%d", keyPrefix, keyNum))
+				
+				counter++
+				bins := aero.BinMap{
+					"id":        keyNum,
+					"counter":   counter,
+					"worker_id": workerID,
+					"batch_id":  i,
+					"timestamp": time.Now().Unix(),
+					"data":      fmt.Sprintf("data_%d_%d_%d", workerID, counter, i),
+				}
+				
+				err := c.client.Put(policy, key, bins)
+				if err != nil {
+					errors++
+				}
+			}
+			
+			latency := time.Since(start).Microseconds()
+
+			atomic.AddInt64(&stats.totalOps, 1)
+			if errors == batchSize {
+				atomic.AddInt64(&stats.errorOps, 1)
+			} else if errors > 0 {
+				atomic.AddInt64(&stats.errorOps, 1)
+			} else {
+				atomic.AddInt64(&stats.successOps, 1)
+				stats.recordLatency(latency)
+			}
+		}
+	}
+}
+
+func (c *CLI) reportProgress(duration int, stopChan chan bool, stats *LoadTestStats, opType string) {
+	endTime := stats.startTime.Add(time.Duration(duration) * time.Second)
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+
+	fmt.Println("\nRunning... (updates every 5 seconds)")
+	fmt.Println("----------------------------------------")
+
+	for time.Now().Before(endTime) {
+		select {
+		case <-ticker.C:
+			elapsed := time.Since(stats.startTime).Seconds()
+			total := atomic.LoadInt64(&stats.totalOps)
+			success := atomic.LoadInt64(&stats.successOps)
+			errors := atomic.LoadInt64(&stats.errorOps)
+			timeouts := atomic.LoadInt64(&stats.timeoutOps)
+			
+			opsPerSec := float64(total) / elapsed
+			
+			fmt.Printf("[%.0fs] Ops: %d | Success: %d | Errors: %d | Timeouts: %d | Rate: %.0f ops/sec\n",
+				elapsed, total, success, errors, timeouts, opsPerSec)
+		default:
+			time.Sleep(100 * time.Millisecond)
+		}
+	}
+}
+
+func (c *CLI) printLoadTestReport(stats *LoadTestStats, opType string) {
+	totalDuration := time.Since(stats.startTime).Seconds()
+	total := atomic.LoadInt64(&stats.totalOps)
+	success := atomic.LoadInt64(&stats.successOps)
+	errors := atomic.LoadInt64(&stats.errorOps)
+	timeouts := atomic.LoadInt64(&stats.timeoutOps)
+	
+	avgRate := float64(total) / totalDuration
+	
+	p50, p95, p99, pMax := stats.getPercentiles()
+
+	fmt.Println("\n========================================")
+	fmt.Printf("      %s Load Test Complete\n", opType)
+	fmt.Println("========================================")
+	fmt.Printf("Duration:        %.2f seconds\n", totalDuration)
+	fmt.Printf("Total Ops:       %d\n", total)
+	fmt.Printf("Successful:      %d (%.2f%%)\n", success, float64(success)/float64(total)*100)
+	fmt.Printf("Errors:          %d (%.2f%%)\n", errors, float64(errors)/float64(total)*100)
+	fmt.Printf("Timeouts:        %d (%.2f%%)\n", timeouts, float64(timeouts)/float64(total)*100)
+	fmt.Printf("Average Rate:    %.0f ops/sec\n", avgRate)
+	
+	if len(stats.latencies) > 0 {
+		fmt.Println("\nLatency Distribution (microseconds):")
+		fmt.Printf("  P50:  %d µs (%.2f ms)\n", p50, float64(p50)/1000)
+		fmt.Printf("  P95:  %d µs (%.2f ms)\n", p95, float64(p95)/1000)
+		fmt.Printf("  P99:  %d µs (%.2f ms)\n", p99, float64(p99)/1000)
+		fmt.Printf("  Max:  %d µs (%.2f ms)\n", pMax, float64(pMax)/1000)
+	}
+	fmt.Println("========================================")
+}
+
+// Add these functions to the end of your main.go file after the load test functions
+
 func (c *CLI) handleCreateIndex(args []string) {
 	if len(args) < 3 {
 		fmt.Println("Usage: create-index <name> <bin> <type>")
@@ -1616,119 +2325,6 @@ func (c *CLI) executeUDFQuery(namespace, set, whereClause, module, function stri
 	fmt.Println("\n\nUDF execution completed successfully")
 }
 
-func (c *CLI) executeUDFRange(namespace, set, whereClause, module, function string, args []aero.Value) {
-	upperClause := strings.ToUpper(whereClause)
-	betweenIdx := strings.Index(upperClause, " BETWEEN ")
-	andIdx := strings.LastIndex(upperClause, " AND ")
-	
-	if betweenIdx == -1 || andIdx == -1 || andIdx <= betweenIdx {
-		fmt.Println("Error: Invalid BETWEEN clause format")
-		return
-	}
-
-	binName := strings.TrimSpace(whereClause[:betweenIdx])
-	lowerStr := strings.TrimSpace(whereClause[betweenIdx+9 : andIdx])
-	upperStr := strings.TrimSpace(whereClause[andIdx+5:])
-
-	lower := c.parseValue(lowerStr)
-	upper := c.parseValue(upperStr)
-
-	var lowerInt, upperInt int64
-	switch v := lower.(type) {
-	case int64:
-		lowerInt = v
-	case int:
-		lowerInt = int64(v)
-	case float64:
-		lowerInt = int64(v)
-	default:
-		fmt.Printf("Error: Lower bound must be numeric, got %T\n", lower)
-		return
-	}
-
-	switch v := upper.(type) {
-	case int64:
-		upperInt = v
-	case int:
-		upperInt = int64(v)
-	case float64:
-		upperInt = int64(v)
-	default:
-		fmt.Printf("Error: Upper bound must be numeric, got %T\n", upper)
-		return
-	}
-
-	stmt := aero.NewStatement(namespace, set)
-	stmt.SetFilter(aero.NewRangeFilter(binName, lowerInt, upperInt))
-
-	policy := c.getQueryPolicy()
-	
-	fmt.Printf("\nExecuting UDF '%s.%s' on range query where %s BETWEEN %v AND %v\n", 
-		module, function, binName, lowerInt, upperInt)
-	fmt.Println("----------------------------------------")
-
-	task, err := c.client.ExecuteUDF(policy, stmt, module, function, args...)
-	if err != nil {
-		c.logError("Background UDF execution failed", err)
-		return
-	}
-
-	fmt.Println("Background job initiated")
-	fmt.Print("Waiting for completion")
-
-	for {
-		done, err := task.IsDone()
-		if err != nil {
-			c.logError("Error checking task status", err)
-			return
-		}
-		if done {
-			break
-		}
-		fmt.Print(".")
-		time.Sleep(500 * time.Millisecond)
-	}
-
-	fmt.Println("\n\nUDF execution completed successfully")
-}
-
-func (c *CLI) executeUDFScan(namespace, set, module, function string, args []aero.Value) {
-	stmt := aero.NewStatement(namespace, set)
-
-	policy := c.getQueryPolicy()
-	
-	fmt.Printf("\nExecuting background UDF '%s.%s' on namespace='%s'", module, function, namespace)
-	if set != "" {
-		fmt.Printf(", set='%s'", set)
-	}
-	fmt.Println()
-	fmt.Println("----------------------------------------")
-
-	task, err := c.client.ExecuteUDF(policy, stmt, module, function, args...)
-	if err != nil {
-		c.logError("Background UDF execution failed", err)
-		return
-	}
-
-	fmt.Println("Background job initiated")
-	fmt.Print("Waiting for completion")
-
-	for {
-		done, err := task.IsDone()
-		if err != nil {
-			c.logError("Error checking task status", err)
-			return
-		}
-		if done {
-			break
-		}
-		fmt.Print(".")
-		time.Sleep(500 * time.Millisecond)
-	}
-
-	fmt.Println("\n\nUDF execution completed successfully")
-}
-
 func (c *CLI) handleBatchPut(args []string) {
 	if len(args) < 1 {
 		fmt.Println("Usage: batch-put <key1:bin=val> <key2:bin=val> ...")
@@ -1966,6 +2562,8 @@ func (c *CLI) handleUse(args []string) {
 	fmt.Println()
 }
 
+// Policy Functions
+
 func (c *CLI) getWritePolicy() *aero.WritePolicy {
 	policy := aero.NewWritePolicy(0, uint32(c.config.Expiration))
 	policy.SocketTimeout = c.config.SocketTimeout
@@ -2127,6 +2725,8 @@ func (c *CLI) getBatchPolicy() *aero.BatchPolicy {
 	return policy
 }
 
+// Utility Functions
+
 func (c *CLI) parseValue(s string) interface{} {
 	if i, err := strconv.ParseInt(s, 10, 64); err == nil {
 		return i
@@ -2255,4 +2855,117 @@ func parseCommand(line string) []string {
 	}
 
 	return parts
+}
+
+func (c *CLI) executeUDFRange(namespace, set, whereClause, module, function string, args []aero.Value) {
+	upperClause := strings.ToUpper(whereClause)
+	betweenIdx := strings.Index(upperClause, " BETWEEN ")
+	andIdx := strings.LastIndex(upperClause, " AND ")
+	
+	if betweenIdx == -1 || andIdx == -1 || andIdx <= betweenIdx {
+		fmt.Println("Error: Invalid BETWEEN clause format")
+		return
+	}
+
+	binName := strings.TrimSpace(whereClause[:betweenIdx])
+	lowerStr := strings.TrimSpace(whereClause[betweenIdx+9 : andIdx])
+	upperStr := strings.TrimSpace(whereClause[andIdx+5:])
+
+	lower := c.parseValue(lowerStr)
+	upper := c.parseValue(upperStr)
+
+	var lowerInt, upperInt int64
+	switch v := lower.(type) {
+	case int64:
+		lowerInt = v
+	case int:
+		lowerInt = int64(v)
+	case float64:
+		lowerInt = int64(v)
+	default:
+		fmt.Printf("Error: Lower bound must be numeric, got %T\n", lower)
+		return
+	}
+
+	switch v := upper.(type) {
+	case int64:
+		upperInt = v
+	case int:
+		upperInt = int64(v)
+	case float64:
+		upperInt = int64(v)
+	default:
+		fmt.Printf("Error: Upper bound must be numeric, got %T\n", upper)
+		return
+	}
+
+	stmt := aero.NewStatement(namespace, set)
+	stmt.SetFilter(aero.NewRangeFilter(binName, lowerInt, upperInt))
+
+	policy := c.getQueryPolicy()
+	
+	fmt.Printf("\nExecuting UDF '%s.%s' on range query where %s BETWEEN %v AND %v\n", 
+		module, function, binName, lowerInt, upperInt)
+	fmt.Println("----------------------------------------")
+
+	task, err := c.client.ExecuteUDF(policy, stmt, module, function, args...)
+	if err != nil {
+		c.logError("Background UDF execution failed", err)
+		return
+	}
+
+	fmt.Println("Background job initiated")
+	fmt.Print("Waiting for completion")
+
+	for {
+		done, err := task.IsDone()
+		if err != nil {
+			c.logError("Error checking task status", err)
+			return
+		}
+		if done {
+			break
+		}
+		fmt.Print(".")
+		time.Sleep(500 * time.Millisecond)
+	}
+
+	fmt.Println("\n\nUDF execution completed successfully")
+}
+
+func (c *CLI) executeUDFScan(namespace, set, module, function string, args []aero.Value) {
+	stmt := aero.NewStatement(namespace, set)
+
+	policy := c.getQueryPolicy()
+	
+	fmt.Printf("\nExecuting background UDF '%s.%s' on namespace='%s'", module, function, namespace)
+	if set != "" {
+		fmt.Printf(", set='%s'", set)
+	}
+	fmt.Println()
+	fmt.Println("----------------------------------------")
+
+	task, err := c.client.ExecuteUDF(policy, stmt, module, function, args...)
+	if err != nil {
+		c.logError("Background UDF execution failed", err)
+		return
+	}
+
+	fmt.Println("Background job initiated")
+	fmt.Print("Waiting for completion")
+
+	for {
+		done, err := task.IsDone()
+		if err != nil {
+			c.logError("Error checking task status", err)
+			return
+		}
+		if done {
+			break
+		}
+		fmt.Print(".")
+		time.Sleep(500 * time.Millisecond)
+	}
+
+	fmt.Println("\n\nUDF execution completed successfully")
 }
